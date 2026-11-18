@@ -4,7 +4,7 @@ import {createHmac,randomUUID} from 'node:crypto';
 import {isIP} from 'node:net';
 
 const MiB=1024*1024,DAY=86400000;
-export const UPLOAD_DEFAULTS=Object.freeze({visitorDailyBytes:100*MiB,ipDailyBytes:500*MiB,visitorDailyFiles:200,ipDailyFiles:1000,totalBytes:20*1024*MiB,minFreeBytes:2*1024*MiB,maxConcurrent:4,maxPerVisitor:3,maxPerIp:4});
+export const UPLOAD_DEFAULTS=Object.freeze({visitorDailyBytes:1000*MiB,ipDailyBytes:2000*MiB,visitorDailyFiles:200,ipDailyFiles:1000,totalBytes:20*1024*MiB,minFreeBytes:2*1024*MiB,maxConcurrent:4,maxPerVisitor:3,maxPerIp:4});
 export function uploadLimits(env=process.env){
  const values={};
  for(const [key,name]of Object.entries({visitorDailyBytes:'UPLOAD_VISITOR_DAILY_BYTES',ipDailyBytes:'UPLOAD_IP_DAILY_BYTES',visitorDailyFiles:'UPLOAD_VISITOR_DAILY_FILES',ipDailyFiles:'UPLOAD_IP_DAILY_FILES',totalBytes:'UPLOAD_TOTAL_BYTES',minFreeBytes:'UPLOAD_MIN_FREE_BYTES',maxConcurrent:'UPLOAD_CONCURRENT',maxPerVisitor:'UPLOAD_CONCURRENT_VISITOR',maxPerIp:'UPLOAD_CONCURRENT_IP'})){
