@@ -4,6 +4,9 @@ const messages=new Map(),pending=new Map(),visible=new Set(),reported=new Set();
 const rowCache=new Map();
 // Local revisions order HTTP snapshots against events received while in flight.
 const messageChanges=new Map(),removedMessages=new Set();
+const messageVersions=new Map();
+let snapshotVersion=-1;
+const versionOf=value=>Number.isSafeInteger(value)&&value>=0?value:null;
 let changeSequence=0,syncSequence=0,initializationSequence=0;
 let ready=false,selectedFile=null,sending=false,ws=null,reconnectDelay=1000,reconnectTimer=null,readTimer=null,toastTimer=null,serverOffset=0;
 const MAX=20*1024*1024,DAY=86400000;
@@ -80,7 +83,10 @@ function render(){
  }
 }
 function put(m,observedAt=changeSequence){
- if(removedMessages.has(m.id)||(messageChanges.get(m.id)||0)>observedAt)return;
+ const version=versionOf(m.version);
+ if(removedMessages.has(m.id))return;
+ if(version!==null){if(version<=snapshotVersion||version<=(messageVersions.get(m.id)??-1))return;messageVersions.set(m.id,version);}
+ else if((messageChanges.get(m.id)||0)>observedAt)return;
  const existing=messages.get(m.id);messages.set(m.id,m);messageChanges.set(m.id,++changeSequence);
  if(m.clientId)pending.delete(m.clientId);
  render();if(!existing)bottom();
@@ -89,15 +95,24 @@ async function sync(){
  if(!ready)return;
  const observedAt=changeSequence,request=++syncSequence;
  const d=await api('/api/messages');if(request!==syncSequence)return;serverOffset=d.serverTime-Date.now();
+ applySnapshot(d,observedAt);
+}
+function applySnapshot(d,observedAt=changeSequence){
+ const version=versionOf(d.stateVersion);
+ if(version!==null&&version<snapshotVersion)return;
  const had=new Set(messages.keys()),received=new Set(d.messages.map(m=>m.id));
- for(const id of had)if(!received.has(id)&&(messageChanges.get(id)||0)<=observedAt)removeMessage(id);
+ for(const id of had)if(!received.has(id)&&(version!==null?(messageVersions.get(id)??-1)<=version:(messageChanges.get(id)||0)<=observedAt))removeMessage(id);
  for(const m of d.messages){
-  if(removedMessages.has(m.id)||(messageChanges.get(m.id)||0)>observedAt)continue;
+  const messageVersion=versionOf(m.version);
+  if(removedMessages.has(m.id)||(version!==null&&messageVersion!==null?(messageVersions.get(m.id)??-1)>messageVersion:(messageChanges.get(m.id)||0)>observedAt))continue;
+  if(messageVersion!==null)messageVersions.set(m.id,messageVersion);
   messages.set(m.id,m);messageChanges.set(m.id,++changeSequence);if(m.clientId)pending.delete(m.clientId);
  }
+ if(version!==null)snapshotVersion=version;
  render();if(d.messages.some(m=>!had.has(m.id)))bottom();
 }
-function removeMessage(id){
+function removeMessage(id,version=null){
+ if(version!==null){if(version<=snapshotVersion||version<=(messageVersions.get(id)??-1))return;messageVersions.set(id,version);}
  messages.delete(id);reported.delete(id);removedMessages.add(id);messageChanges.set(id,++changeSequence);
  if($('image-dialog').dataset.id===id)$('image-dialog').close();
 }
@@ -115,7 +130,7 @@ function connect(){
  }
  const socket=new WebSocket(`${location.protocol==='https:'?'wss:':'ws:'}//${location.host}/ws`);ws=socket;
  socket.onopen=()=>{if(ws!==socket)return;reconnectDelay=1000;connection(true,'已连接 · 请留言咨询');sync().catch(()=>{});};
- socket.onmessage=event=>{if(ws!==socket)return;try{const d=JSON.parse(event.data);if(d.type==='message')put(d.message);if(d.type==='remove'){removeMessage(d.id);render();}}catch{}};
+ socket.onmessage=event=>{if(ws!==socket)return;try{const d=JSON.parse(event.data);if(d.type==='message')put(d.message);if(d.type==='remove'){removeMessage(d.id,versionOf(d.version));render();}}catch{}};
  socket.onclose=()=>{if(ws!==socket)return;ws=null;connection(false,navigator.onLine?'连接恢复中…':'网络已断开，等待恢复');reconnectTimer=setTimeout(()=>{reconnectTimer=null;connect();},reconnectDelay+Math.random()*500);reconnectDelay=Math.min(30000,reconnectDelay*1.7);};
  socket.onerror=()=>{if(ws===socket)socket.close();};
 }
@@ -127,7 +142,8 @@ async function initialize(){
   const d=navigator.locks?await navigator.locks.request('kf-session',getSession):await getSession();
   if(request!==initializationSequence)return;
   serverOffset=d.serverTime-Date.now();document.title=d.name;$('site-name').textContent=d.name;
-  messages.clear();for(const m of d.messages)messages.set(m.id,m);ready=true;input.disabled=false;$('loading-state').hidden=true;render();bottom();updateSend();connect();
+  messages.clear();messageChanges.clear();messageVersions.clear();removedMessages.clear();snapshotVersion=-1;changeSequence=0;
+  applySnapshot(d);ready=true;input.disabled=false;$('loading-state').hidden=true;render();bottom();updateSend();connect();
  }catch(e){if(request!==initializationSequence)return;connection(false,'暂时无法连接');$('loading-state').classList.add('failed');$('loading-state').querySelector('span:nth-child(2)').textContent=e.message;$('retry-connect').hidden=false;}
 }
 function attachment(file){if(file&&file.size>MAX){toast('单个附件不能超过 20 MB');$('file-input').value='';return;}selectedFile=file||null;$('attachment-preview').hidden=!file;if(file){$('attachment-name').textContent=file.name;$('attachment-size').textContent=size(file.size);}updateSend();}

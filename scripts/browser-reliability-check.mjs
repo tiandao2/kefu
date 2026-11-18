@@ -33,10 +33,10 @@ const reservation=createServer();await new Promise(r=>reservation.listen(0,'127.
 const base=`http://127.0.0.1:${port}`;
 async function hook(message,edited=false){const r=await fetch(base+'/telegram/webhook',{method:'POST',headers:{'Content-Type':'application/json','X-Telegram-Bot-Api-Secret-Token':'review-secret'},body:JSON.stringify({update_id:update++,[edited?'edited_message':'message']:message})});assert.equal(r.status,200);}
 const staff=(v,id,text)=>({message_id:id,message_thread_id:v.topic_id,chat:{id:-100123},from:{id:42,is_bot:false},date:Math.floor(Date.now()/1000),text});
-async function fixturePage(){
+async function fixturePage(setup){
  const context=await browser.newContext({viewport:{width:390,height:844}});
  await context.addInitScript(()=>{const Native=window.WebSocket;window.__testSockets=[];window.WebSocket=class extends Native{constructor(...args){super(...args);window.__testSockets.push(this);}};});
- const page=await context.newPage();const errors=[];page.on('pageerror',e=>errors.push(e.message));
+ const page=await context.newPage();if(setup)await setup(page);const errors=[];page.on('pageerror',e=>errors.push(e.message));
  await page.goto(base);await page.waitForFunction(()=>!document.getElementById('message-input').disabled);
  await page.waitForFunction(()=>document.getElementById('connection-label').textContent.includes('已连接'));
  const cookie=(await context.cookies()).find(c=>c.name==='kf_session');
@@ -111,6 +111,45 @@ try{
  assert.equal(await page.getByText('snapshot-new-edit',{exact:true}).count(),1);assert.equal(await page.getByText('new-message-during-snapshot',{exact:true}).count(),1);
  assert.equal(await page.getByText('snapshot-old-edit',{exact:true}).count(),0);
  results.checks.push({id:'snapshot_preserves_new_edit_and_inflight_message',passed:true});await context.close();
+ }
+
+ // The WebSocket keeps its own order, but an independent HTTP snapshot may
+ // arrive before older frames. A snapshot watermark also covers unseen ids.
+ {
+ let pageSocket;const held=[];
+ const {context,page,v,errors}=await fixturePage(async page=>{
+  await page.routeWebSocket('**/ws',route=>{
+   pageSocket=route;const server=route.connectToServer();
+   server.onMessage(data=>{const d=JSON.parse(data.toString());if(d.type==='remove'||d.type==='message'&&d.message.body?.startsWith('reverse-'))held.push(data);else route.send(data);});
+  });
+ });
+ async function snapshot(){const response=page.waitForResponse(r=>r.url().endsWith('/api/messages')&&r.request().method()==='GET');await page.evaluate(()=>document.dispatchEvent(new Event('visibilitychange')));const r=await response;await r.finished();await delay(150);return r.json();}
+ async function flushAssert(assertion){for(const frame of held.splice(0)){pageSocket.send(frame);await delay(80);await assertion();}}
+ await hook(staff(v,2201,'reverse-old-edit'));await until(()=>held.length===1);
+ await hook({...staff(v,2201,'reverse-new-edit'),edit_date:Math.floor(Date.now()/1000)+1},true);await until(()=>held.length===2);
+ await snapshot();await page.getByText('reverse-new-edit',{exact:true}).waitFor();
+ await flushAssert(async()=>{assert.equal(await page.getByText('reverse-new-edit',{exact:true}).count(),1);assert.equal(await page.getByText('reverse-old-edit',{exact:true}).count(),0);});
+ results.checks.push({id:'fresh_snapshot_rejects_delayed_realtime_edit',passed:true,page_errors:errors});
+
+ await page.locator('#message-input').fill('reverse-delivery-state');await page.locator('#send-button').click();
+ await until(()=>db.prepare("SELECT status FROM messages WHERE visitor_id=? AND body='reverse-delivery-state'").get(v.id)?.status==='sent');
+ await snapshot();const delivered=page.locator('.message').filter({hasText:'reverse-delivery-state'});
+ await flushAssert(async()=>assert.equal(await delivered.getByText('已发送',{exact:true}).count(),1));
+ results.checks.push({id:'fresh_snapshot_rejects_delayed_realtime_queued_status',passed:true});
+
+ await hook({...staff(v,2202,undefined),caption:'reverse-image-version',photo:[{file_id:'reverse-image',width:32,height:24,file_size:png.length}]});
+ await until(()=>db.prepare('SELECT file_status FROM messages WHERE visitor_id=? AND tg_message_id=2202').get(v.id)?.file_status==='ready');
+ await snapshot();const imageRow=page.locator('.message').filter({hasText:'reverse-image-version'});await imageRow.locator('img').waitFor();
+ await flushAssert(async()=>assert.equal(await imageRow.locator('img').count(),1));
+ results.checks.push({id:'fresh_snapshot_rejects_delayed_realtime_attachment_placeholder',passed:true});
+
+ await hook(staff(v,2203,'reverse-unseen-revoked'));await until(()=>held.length>0);
+ await hook({...staff(v,2204,'撤回'),reply_to_message:{message_id:2203}});
+ await until(()=>db.prepare('SELECT revoked FROM messages WHERE visitor_id=? AND tg_message_id=2203').get(v.id)?.revoked===1);
+ const current=await snapshot();assert.ok(!current.messages.some(m=>m.body==='reverse-unseen-revoked'));
+ await flushAssert(async()=>assert.equal(await page.getByText('reverse-unseen-revoked',{exact:true}).count(),0));
+ results.checks.push({id:'snapshot_watermark_rejects_unseen_message_revoked_before_snapshot',passed:true});
+ await context.close();
  }
 
  // A queued POST response must not overwrite the newer delivered event.

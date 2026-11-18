@@ -9,10 +9,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { createIpCnLookup } from './ip-location.mjs';
+import { createIpCnLookup, normalizePublicIp } from './ip-location.mjs';
 import { requestOriginAllowed,originDiagnostic } from './request-origin.mjs';
 import { largestPhoto, prepareTelegramPhoto, createImagePreview } from './images.mjs';
 import { topicTitle, upgradeLegacyTopicTitle } from './topic-names.mjs';
+import { initializeMessageState, messageSnapshot } from './message-state.mjs';
 
 // The overseas Telegram route can take longer than Node's 250 ms default
 // before IPv4 connects. Keep dual-stack fallback without abandoning it early.
@@ -89,7 +90,10 @@ db.transaction(() => {
     if (!jobColumns.has(name)) db.exec(`ALTER TABLE jobs ADD COLUMN ${name} ${definition}`);
   }
   db.exec('UPDATE messages SET tg_topic_id=(SELECT topic_id FROM visitors WHERE visitors.id=messages.visitor_id) WHERE tg_message_id IS NOT NULL AND tg_topic_id IS NULL');
+  const visitorColumns=new Set(db.prepare('PRAGMA table_info(visitors)').all().map(c=>c.name));
+  for(const column of ['auto_title','pending_title'])if(!visitorColumns.has(column))db.exec(`ALTER TABLE visitors ADD COLUMN ${column} TEXT`);
 })();
+initializeMessageState(db);
 
 const now = () => Date.now();
 const hash = x => createHash('sha256').update(x).digest('hex');
@@ -111,6 +115,7 @@ function queue(kind, payload, dedup = null) {
 function jobScope(kind, p) {
   const visitorId = p.visitorId || (p.messageId && sql('SELECT visitor_id FROM messages WHERE id=?', p.messageId)?.visitor_id);
   if (kind === 'update') return {lane:'metadata',category:'metadata'};
+  if (kind === 'region') return {lane:`region:${visitorId}`,category:'geo'};
   if (['incoming-file','photo-store'].includes(kind)) return {lane:`file:${p.messageId}`,category:'download'};
   if (['topic','welcome','outgoing','photo-caption'].includes(kind)) return {lane:`send:${visitorId || p.messageId}`,category:'send'};
   return {lane:`aux:${p.topicId || visitorId || p.messageId}`,category:'aux'};
@@ -157,7 +162,7 @@ function broadcast(visitorId, data) {
   for (const ws of sockets.get(visitorId) || []) if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
 }
 function publicMessage(m) {
-  return { id: m.id, clientId: m.client_id, direction: m.direction, kind: m.kind,
+  return { id: m.id, version: m.revision, clientId: m.client_id, direction: m.direction, kind: m.kind,
     body: m.body, filename: m.filename, mime: m.mime, size: m.size, sentAt: m.sent_at,
     editedAt: m.edited_at, readAt: m.read_at, status: m.status, originalFile: !m.is_photo,
     failureReason: m.failure_reason, fileStatus: m.file_status, fileError: m.file_error,
@@ -201,6 +206,10 @@ function missingTopic(e) {
 function missingMessage(e) {
   return e.code === 400 && /message[ _]id[ _]invalid|message (?:to (?:react|reply|be replied).* )?not found|message to react to not found/i.test(e.message);
 }
+function queueRegion(v,value) {
+  const ip=normalizePublicIp(value);
+  if(process.env.GEO_ENABLED==='1'&&ip&&(!v.title||(v.auto_title===v.title&&v.title===topicTitle(v.number,'未知地区'))))queue('region',{visitorId:v.id,ip},`region:${v.id}`);
+}
 async function ensureTopic(v, ip, obsoleteTopic = null) {
   return locked(`topic:${v.id}`, async () => {
     let fresh = sql('SELECT * FROM visitors WHERE id=?', v.id);
@@ -209,15 +218,53 @@ async function ensureTopic(v, ip, obsoleteTopic = null) {
       fresh.topic_id = null;
     }
     if (fresh.topic_id) return fresh;
-    const title = fresh.title ? upgradeLegacyTopicTitle(fresh.number, fresh.title) : topicTitle(fresh.number, await region(ip));
+    queueRegion(fresh,ip);
+    const automatic=!fresh.title||fresh.title===fresh.auto_title;
+    const title = fresh.title ? upgradeLegacyTopicTitle(fresh.number, fresh.title) : topicTitle(fresh.number,'未知地区');
     const topic = await telegram('createForumTopic', { chat_id: CHAT_ID, name: title });
     db.transaction(() => {
-      run('UPDATE visitors SET topic_id=?,title=? WHERE id=?', topic.message_thread_id, title, v.id);
+      run('UPDATE visitors SET topic_id=?,title=?,auto_title=? WHERE id=?', topic.message_thread_id, title, automatic?title:null, v.id);
       // Wake messages that were already waiting on this visitor's old topic.
       run("UPDATE jobs SET available_at=? WHERE kind IN ('outgoing','welcome') AND json_extract(payload,'$.messageId') IN (SELECT id FROM messages WHERE visitor_id=?)", now(), v.id);
     })();
     fresh = sql('SELECT * FROM visitors WHERE id=?', v.id);
     return fresh;
+  });
+}
+async function completeRegion(p) {
+  const automatic=v=>v&&(!v.title||v.auto_title===v.title);
+  if(!automatic(sql('SELECT * FROM visitors WHERE id=?',p.visitorId)))return;
+  const location=await region(p.ip);
+  if(location==='未知地区')throw new Error('归属地服务暂时不可用');
+  return locked(`topic:${p.visitorId}`,async()=>{
+    let v=sql('SELECT * FROM visitors WHERE id=?',p.visitorId);
+    if(!automatic(v))return;
+    const title=topicTitle(v.number,location);
+    if(title===v.title)return;
+    if(!v.topic_id){run('UPDATE visitors SET title=?,auto_title=? WHERE id=?',title,title,v.id);return;}
+    run('UPDATE visitors SET pending_title=? WHERE id=?',title,v.id);
+    try{
+      try{await telegram('editForumTopic',{chat_id:CHAT_ID,message_thread_id:v.topic_id,name:title});}
+      catch(e){if(!(Number(e.code)===400&&/not[_ ]modified/i.test(e.message)))throw e;}
+      const current=sql('SELECT * FROM visitors WHERE id=?',v.id);
+      // A manual rename can arrive while the Telegram request is in flight.
+      // Preserve it locally and restore it remotely if our edit crossed it.
+      if(!automatic(current)){
+        if(current.topic_id===v.topic_id)queue('restore-title',{visitorId:v.id,topicId:v.topic_id},`restore-title:${v.id}:${v.topic_id}`);
+        return;
+      }
+      run('UPDATE visitors SET title=?,auto_title=? WHERE id=?',title,title,v.id);
+    }finally{run('UPDATE visitors SET pending_title=NULL WHERE id=? AND pending_title=?',v.id,title);}
+  });
+}
+async function restoreManualTitle(p) {
+  return locked(`topic:${p.visitorId}`,async()=>{
+    const v=sql('SELECT * FROM visitors WHERE id=?',p.visitorId);
+    if(!v||v.topic_id!==p.topicId||!v.title||v.auto_title!==null)return;
+    try{await telegram('editForumTopic',{chat_id:CHAT_ID,message_thread_id:v.topic_id,name:v.title});}
+    catch(e){if(missingTopic(e))return;if(!(Number(e.code)===400&&/not[_ ]modified/i.test(e.message)))throw e;}
+    const current=sql('SELECT * FROM visitors WHERE id=?',v.id);
+    if(current.topic_id===v.topic_id&&current.title!==v.title)throw new Error('人工话题名再次更新，等待同步');
   });
 }
 async function sendToVisitor(visitorId, method, body, file) {
@@ -291,14 +338,14 @@ app.post('/api/session', async (req, res, next) => {
     if (!v.topic_id) {
       queue('topic', { visitorId: v.id, ip: req.ip }, `topic:${v.id}`);
     }
+    queueRegion(v,req.ip);
     ensureWelcome(v);
-    const messages = db.prepare('SELECT * FROM messages WHERE visitor_id=? AND revoked=0 AND sent_at>? ORDER BY sent_at,id').all(v.id, now() - DAY).map(publicMessage);
-    res.json({ name: SITE_NAME, number: String(v.number).padStart(6,'0'), messages, maxFileSize: MB20, serverTime: now(), topicReady: !!v.topic_id });
+    res.json({ name: SITE_NAME, number: String(v.number).padStart(6,'0'), ...messageSnapshot(db,v.id,now()-DAY,publicMessage), maxFileSize: MB20, serverTime: now(), topicReady: !!v.topic_id });
   } catch(e) { next(e); }
 });
 app.get('/api/messages', requireVisitor, (req,res) => {
   ensureWelcome(req.visitor);
-  res.json({ messages: db.prepare('SELECT * FROM messages WHERE visitor_id=? AND revoked=0 AND sent_at>? ORDER BY sent_at,id').all(req.visitor.id, now() - DAY).map(publicMessage), serverTime: now() });
+  res.json({ ...messageSnapshot(db,req.visitor.id,now()-DAY,publicMessage), serverTime: now() });
 });
 const upload = multer({ storage: multer.diskStorage({ destination: FILES, filename: (req,file,cb) => cb(null, randomUUID()) }), limits: { fileSize: MB20, files: 1, fields: 3, fieldSize: 20000 } });
 app.post('/api/messages', requireVisitor, (req,res,next) => {
@@ -405,7 +452,19 @@ function processUpdate(update) {
   if(!m || String(m.chat?.id)!==CHAT_ID) return;
   const v=sql('SELECT * FROM visitors WHERE topic_id=?',m.message_thread_id || -1);
   if(!v) return;
-  if(m.forum_topic_edited?.name) { run('UPDATE visitors SET title=? WHERE id=?',m.forum_topic_edited.name,v.id); return; }
+  if(m.forum_topic_edited?.name) {
+    const name=m.forum_topic_edited.name;
+    const ownBot=m.from?.is_bot&&String(m.from.id)===BOT_TOKEN.split(':')[0];
+    if(ownBot){
+      if(name===v.pending_title||name===v.auto_title)run('UPDATE visitors SET title=?,auto_title=? WHERE id=?',name,name,v.id);
+    }else db.transaction(()=>{
+      run('UPDATE visitors SET title=?,auto_title=NULL,pending_title=NULL WHERE id=?',name,v.id);
+      // Save compensation before the in-flight automatic edit can finish or
+      // the process can restart. The topic lock orders the actual requests.
+      if(v.pending_title)queue('restore-title',{visitorId:v.id,topicId:v.topic_id},`restore-title:${v.id}:${v.topic_id}`);
+    })();
+    return;
+  }
   if(m.from?.is_bot || !STAFF_IDS.has(String(m.from?.id))) return;
   const command=(m.text || '').trim()==='撤回' || /^\/ch(?:@[a-zA-Z0-9_]+)?(?:\s|$)/i.test(m.text || '');
   if(command) {
@@ -417,6 +476,7 @@ function processUpdate(update) {
     const verifiedReply=reply && Number.isSafeInteger(target) && reply.from && !reply.from.is_bot && STAFF_IDS.has(String(reply.from.id)) &&
       (!reply.chat || String(reply.chat.id)===CHAT_ID) && (!reply.message_thread_id || reply.message_thread_id===v.topic_id) &&
       Number(reply.date)*1000>now()-7*DAY && Number(reply.date)*1000<=now()+60000;
+    let removed;
     db.transaction(() => {
       const op=run('INSERT OR IGNORE INTO operations(id,created_at) VALUES(?,?)',`revoke:${m.message_id}`,now());
       if(!op.changes) return;
@@ -424,12 +484,13 @@ function processUpdate(update) {
         run('INSERT OR IGNORE INTO tombstones(visitor_id,topic_id,message_id,created_at) VALUES(?,?,?,?)',v.id,v.topic_id,target,now());
         if(found) {
           run('UPDATE messages SET revoked=1 WHERE id=?',found.id);
-          broadcast(v.id,{type:'remove',id:found.id});
+          removed={type:'remove',id:found.id,version:sql('SELECT revision FROM messages WHERE id=?',found.id).revision};
         }
         queue('notice',{topicId:v.topic_id,text:'已撤回',replyId:m.message_id},`revoke-notice:${m.message_id}`);
       } else queue('notice',{topicId:v.topic_id,text:'请回复一条最近 7 天内由客服发送的客户消息，再发送“撤回”。',replyId:m.message_id},`revoke-notice:${m.message_id}`);
       run('INSERT OR IGNORE INTO processed_updates(id,created_at) VALUES(?,?)',update.update_id,now());
     })();
+    if(removed)broadcast(v.id,removed);
     return;
   }
   if((m.text || '').startsWith('/')) return;
@@ -501,6 +562,8 @@ async function storePhoto(m) {
 async function processJob(job) {
   const p=JSON.parse(job.payload);
   if(job.kind==='update') return processUpdate(p);
+  if(job.kind==='region') return completeRegion(p);
+  if(job.kind==='restore-title') return restoreManualTitle(p);
   if(job.kind==='topic') {
     const v=sql('SELECT * FROM visitors WHERE id=?',p.visitorId);
     if(v) await ensureTopic(v,p.ip);
@@ -577,7 +640,7 @@ async function processJob(job) {
 }
 const activeJobs=new Map(), laneBusy=new Set();
 let stopping=false,dispatching=false;
-const CAPACITY={send:4,download:2,aux:2};
+const CAPACITY={send:4,download:2,aux:2,geo:2};
 function expiredJob(job) { return job && job.kind!=='update' && job.created_at<=now()-DAY; }
 function assertJobCurrent() {
   if(expiredJob(jobContext.getStore()))throw Object.assign(new Error('任务已超过 24 小时处理期限'),{code:'TASK_EXPIRED',permanent:true});

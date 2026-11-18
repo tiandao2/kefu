@@ -493,7 +493,7 @@ test('legacy database migrates without losing identity and 7-day cleanup preserv
  const original=db.prepare('SELECT * FROM visitors WHERE id=?').get(file.visitor_id);
  db.prepare('UPDATE messages SET sent_at=? WHERE id=?').run(Date.now()-8*86400000,file.id);
  child.kill('SIGTERM');await new Promise(r=>child.once('exit',r));
- db.exec('ALTER TABLE messages DROP COLUMN tg_topic_id; ALTER TABLE messages DROP COLUMN is_photo;');
+ db.exec('DROP TRIGGER message_state_insert; DROP TRIGGER message_state_update; DROP TRIGGER message_state_delete; ALTER TABLE messages DROP COLUMN tg_topic_id; ALTER TABLE messages DROP COLUMN is_photo;');
  child=spawn(process.execPath,['server.mjs'],{env:{...process.env,PORT:'15301',HOST:'127.0.0.1',PUBLIC_ORIGIN:origin,ALLOWED_ORIGINS:' https://alternate.example , ',BOT_TOKEN:'test-token',TG_CHAT_ID:'-100123',STAFF_IDS:'42,43',WEBHOOK_SECRET:'test-secret',DATA_DIR:data,TG_API_BASE:'http://127.0.0.1:15302',NODE_ENV:'test',GEO_ENABLED:'0'},stdio:['ignore','pipe','pipe']});
  child.stdout.on('data',d=>logs+=d);child.stderr.on('data',d=>logs+=d);
  await until(async()=>{try{return(await fetch(base+'/healthz')).ok;}catch{return false;}});
