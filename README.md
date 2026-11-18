@@ -4,9 +4,9 @@
 
 线上仅服务 `kf.wgioat.cn`。部署时同时安装 `deploy/reject-other-hosts.conf` 到 `/etc/nginx/conf.d/`，拒绝其他 SNI 域名的 TLS 握手和其他 Host 的 HTTP 请求。未发送 SNI 的连接仍使用默认的新域名证书。旧域名的 DNS 记录需在其 DNS 服务商处删除；删除服务器站点不会删除外部 DNS 记录。
 
-网站已启用大陆 IP 网段访问限制：页面、API、附件及 WebSocket 仅允许大陆网段和本机回环地址，其他来源返回 403。HTTP/HTTPS 的 `/.well-known/acme-challenge/` 保持公开供证书续期使用；`/telegram/webhook` 仅允许 Telegram 官方来源网段，并继续由应用验证 webhook 密钥。此限制不作用于 SSH 或应用向 Telegram 的出站连接。
+网站页面、API、附件及 WebSocket 对所有地区开放，不按 IP 地域限制访问。访客 Cookie、消息与附件权限、来源检查和限流继续执行。`/telegram/webhook` 仅允许 Telegram 官方来源网段，并由应用验证 webhook 密钥；这属于回调认证。`/.well-known/acme-challenge/` 保持公开供证书续期使用。
 
-网段来自 `gaoyifan/china-operator-ip` 的 `china.txt`、`china6.txt`，根据运营商/BGP 分类，存在地域误判的可能。数据安装在 `/etc/nginx/geo/kf-mainland.cidrs`，由 `kf-mainland-update.timer` 每天 04:20 后随机延迟最多 30 分钟更新。下载、网段合理性或 Nginx 检查失败时保留既有规则。来源和校验摘要保存在 `/etc/nginx/geo/kf-mainland-update.json`。部署需安装 `kf-mainland-geo.conf` 到 `conf.d/`，`kf-mainland-only.conf`、`kf-proxy.conf`、`kf-telegram-sources.conf` 到 `snippets/`，以及更新脚本和定时器；先运行更新脚本的 `--prepare` 模式生成网段文件，再检查并加载站点配置。真实客户端 IP 仅信任现有 Cloudflare 官方代理网段的 `CF-Connecting-IP`，不能对任意请求开启 `real_ip_header` 信任。
+部署时安装 `deploy/kf-proxy.conf`、`deploy/kf-telegram-sources.conf` 到 `/etc/nginx/snippets/`。真实客户端 IP 仅信任已配置的 Cloudflare 官方代理网段的 `CF-Connecting-IP`，不能对任意请求开启真实 IP 头信任。
 
 ## 使用
 

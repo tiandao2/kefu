@@ -1,9 +1,0 @@
-[Unit]
-Description=Refresh mainland China website access ranges
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/kf-mainland-update
-TimeoutStartSec=180
