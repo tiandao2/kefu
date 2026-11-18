@@ -194,4 +194,4 @@ window.addEventListener('pageshow',settleViewport);
 input.addEventListener('focus',settleViewport);
 input.addEventListener('blur',settleViewport);
 viewport();
-initialize();
+if(location.protocol==='https:'||['localhost','127.0.0.1','[::1]'].includes(location.hostname))initialize();

@@ -29,7 +29,7 @@ const server=createServer(async(req,res)=>{
   return;
  }
  const file=path==='/'?'index.html':path.slice(1);
- if(!['index.html','app.js','style.css','favicon.svg','network-check.html','network-check.js'].includes(file)){res.writeHead(404);res.end();return;}
+ if(!['index.html','app.js','https-upgrade.js','style.css','favicon.svg','network-check.html','network-check.js'].includes(file)){res.writeHead(404);res.end();return;}
  try{
   const bytes=await readFile(new URL(file,publicDir));
   res.setHeader('Content-Type',file.endsWith('.js')?'application/javascript':file.endsWith('.html')?'text/html':file.endsWith('.css')?'text/css':'image/svg+xml');res.end(bytes);

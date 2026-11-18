@@ -53,6 +53,21 @@ try{
  db=new Database(path.join(temporary,'chat.sqlite'));db.pragma('busy_timeout=5000');
  browser=await engines[engineName].launch(engineName==='chromium'?{args:['--no-sandbox']}:{});
 
+ // Model a webview still reporting http: after its transport was upgraded.
+ {
+ const context=await browser.newContext(),page=await context.newPage();const requests=[];
+ await page.route('**/*',async route=>{
+  const request=route.request(),url=new URL(request.url());requests.push({url:request.url(),method:request.method()});
+  if(url.protocol==='https:'&&url.pathname==='/')return route.fulfill({contentType:'text/html',body:'<!doctype html><title>HTTPS corrected</title>'});
+  const name=url.pathname==='/'?'index.html':url.pathname.slice(1);
+  if(['index.html','https-upgrade.js','app.js','style.css','favicon.svg'].includes(name))return route.fulfill({contentType:name.endsWith('.js')?'application/javascript':name.endsWith('.css')?'text/css':'text/html',body:readFileSync(path.join(project,'public',name))});
+  return route.fulfill({status:404,body:''});
+ });
+ await page.goto('http://kf-upgrade.test/');await page.waitForURL('https://kf-upgrade.test/');
+ assert.ok(!requests.some(r=>r.url.startsWith('http:')&&(r.url.includes('/api/')||r.url.includes('/ws'))));
+ results.checks.push({id:'http_document_upgrades_before_session_requests',passed:true,final_url:page.url()});await context.close();
+ }
+
  // A GET response captured before a revoke arrives after the realtime event.
  {
  const {context,page,v,errors}=await fixturePage();

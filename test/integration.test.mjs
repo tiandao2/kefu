@@ -505,6 +505,15 @@ test('legacy database migrates without losing identity and 7-day cleanup preserv
 });
 
 
+test('missing Origin with a trusted Referer permits legacy browser sessions and WebSockets',async()=>{
+ const r=await fetch(base+'/api/session',{method:'POST',headers:{'Content-Type':'application/json',Referer:origin+'/'},body:'{}'});
+ assert.equal(r.status,200);const cookie=r.headers.get('set-cookie').split(';')[0];
+ const ws=new WebSocket(base.replace('http','ws')+'/ws',{headers:{Cookie:cookie,Referer:origin+'/'}});await new Promise((resolve,reject)=>{ws.once('open',resolve);ws.once('error',reject);});ws.close();
+ for(const headers of [{},{Referer:'https://evil.example/'},{Origin:'null',Referer:origin+'/'}]){
+  const denied=await fetch(base+'/api/session',{method:'POST',headers:{'Content-Type':'application/json',...headers},body:'{}'});assert.equal(denied.status,403);
+ }
+});
+
 test('additional configured origins allow sessions and WebSockets while unknown origins stay blocked', async () => {
  const alternate='https://alternate.example';
  const session=await request('/api/session',{},null,{Origin:alternate});

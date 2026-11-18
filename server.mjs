@@ -9,7 +9,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { IP2Region } from 'ip2region/node';
+import { createIpCnLookup } from './ip-location.mjs';
+import { requestOriginAllowed,originDiagnostic } from './request-origin.mjs';
 import { largestPhoto, prepareTelegramPhoto, createImagePreview } from './images.mjs';
 import { topicTitle, upgradeLegacyTopicTitle } from './topic-names.mjs';
 
@@ -95,7 +96,7 @@ const hash = x => createHash('sha256').update(x).digest('hex');
 const sql = (s, ...args) => db.prepare(s).get(...args);
 const run = (s, ...args) => db.prepare(s).run(...args);
 const locks = new Map();
-const geo = process.env.GEO_ENABLED === '1' ? await IP2Region.open({ mappedIPv6: 'ipv4' }) : null;
+const region=createIpCnLookup({enabled:process.env.GEO_ENABLED==='1'});
 async function locked(key, fn) {
   const before = locks.get(key) || Promise.resolve();
   let release; const current = new Promise(r => { release = r; });
@@ -194,16 +195,6 @@ async function telegram(method, body = {}, file) {
 async function notice(topicId, text, replyId, dedup) {
   queue('notice', { topicId, text, replyId }, dedup);
 }
-async function region(ip) {
-  if (!geo || !ip || /^(127\.|10\.|192\.168\.|::1$)/.test(ip)) return '未知地区';
-  try {
-    const d = geo.lookup(ip);
-    if (!d) return '未知地区';
-    const province = d.subdivisions?.map(x=>x.name||'').join('') || '';
-    const text = d.country?.code === 'CN' ? `${province}${d.city?.name||''}` : `${d.country?.name||''}${province}${d.city?.name||''}`;
-    return text.replace(/[\u0000-\u001f]/g, '').slice(0, 64) || '未知地区';
-  } catch { return '未知地区'; }
-}
 function missingTopic(e) {
   return e.code === 400 && /message[ _]thread[ _]not[ _]found|topic[ _]id[ _]invalid|topic[ _]deleted/i.test(e.message);
 }
@@ -263,8 +254,12 @@ app.use((req, res, next) => {
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
   res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
+  if(req.path==='/'||req.path==='/index.html')res.setHeader('Cache-Control','no-cache, no-transform');
   if (req.path.startsWith('/api/') || req.path.startsWith('/telegram/')) res.setHeader('Cache-Control', 'private, no-store, max-age=0');
-  if (['POST','PUT','PATCH','DELETE'].includes(req.method) && req.path.startsWith('/api/') && !ALLOWED_ORIGINS.has(req.headers.origin)) return res.status(403).json({ error: '请求来源不正确' });
+  if (['POST','PUT','PATCH','DELETE'].includes(req.method) && req.path.startsWith('/api/') && !requestOriginAllowed(req.headers,ALLOWED_ORIGINS)) {
+    console.warn('Request origin rejected:',JSON.stringify(originDiagnostic(req.headers)));
+    return res.status(403).json({ error: '请求来源不正确' });
+  }
   next();
 });
 app.get('/healthz', (req,res) => res.json({ ok: true, version:APP_VERSION }));
@@ -380,7 +375,7 @@ app.get('/api/files/:id', requireVisitor, (req,res) => {
   res.setHeader('Cache-Control','private, no-store, max-age=0');
   res.sendFile(file);
 });
-app.use(express.static(path.join(HERE, 'public'), { maxAge: '1h', etag: true, setHeaders(res, file) { if(file.endsWith('.html')) res.setHeader('Cache-Control','no-cache'); } }));
+app.use(express.static(path.join(HERE, 'public'), { maxAge: '1h', etag: true, setHeaders(res, file) { if(file.endsWith('.html')) res.setHeader('Cache-Control','no-cache, no-transform'); } }));
 app.use((err,req,res,next) => {
   if (res.headersSent) return next(err);
   if (err instanceof multer.MulterError) return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? '单个附件不能超过 20 MB' : '附件上传失败，请重新选择' });
@@ -676,7 +671,7 @@ const server = createServer(app);
 const wss = new WebSocketServer({ noServer:true,maxPayload:4096 });
 server.on('upgrade',(req,socket,head)=>{
   const v=visitorFrom(req);
-  if(req.url!=='/ws' || !ALLOWED_ORIGINS.has(req.headers.origin) || !v) { socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); socket.destroy(); return; }
+  if(req.url!=='/ws' || !requestOriginAllowed(req.headers,ALLOWED_ORIGINS) || !v) { socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); socket.destroy(); return; }
   if((sockets.get(v.id)?.size||0)>=8) {socket.destroy();return;}
   wss.handleUpgrade(req,socket,head,ws=>{
     if(!sockets.has(v.id)) sockets.set(v.id,new Set());
@@ -692,5 +687,5 @@ setInterval(()=>work().catch(e=>console.error('Worker failure:',e.name)),300).un
 setInterval(()=>{try{cleanup();}catch(e){console.error('Cleanup failure:',e.name);}},3600000).unref();
 cleanup();
 server.listen(PORT,HOST,()=>console.log(`Customer service listening on ${HOST}:${PORT}`));
-function shutdown(){stopping=true;wss.close();for(const set of sockets.values())for(const ws of set)ws.close();server.close(()=>{const drain=setInterval(()=>{if(!activeJobs.size){clearInterval(drain);geo?.close();db.close();process.exit(0);}},50);});setTimeout(()=>process.exit(0),10000).unref();}
+function shutdown(){stopping=true;wss.close();for(const set of sockets.values())for(const ws of set)ws.close();server.close(()=>{const drain=setInterval(()=>{if(!activeJobs.size){clearInterval(drain);db.close();process.exit(0);}},50);});setTimeout(()=>process.exit(0),10000).unref();}
 process.on('SIGTERM',shutdown);process.on('SIGINT',shutdown);
