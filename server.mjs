@@ -14,6 +14,7 @@ import { requestOriginAllowed,originDiagnostic } from './request-origin.mjs';
 import { largestPhoto, prepareTelegramPhoto, createImagePreview } from './images.mjs';
 import { topicTitle, upgradeLegacyTopicTitle } from './topic-names.mjs';
 import { initializeMessageState, messageSnapshot } from './message-state.mjs';
+import { createUploadGuard,uploadLimits } from './upload-guard.mjs';
 
 // The overseas Telegram route can take longer than Node's 250 ms default
 // before IPv4 connects. Keep dual-stack fallback without abandoning it early.
@@ -96,6 +97,7 @@ db.transaction(() => {
   }
 })();
 initializeMessageState(db);
+const uploadGuard=createUploadGuard({db,directory:FILES,secret:SECRET,limits:uploadLimits()});
 
 const now = () => Date.now();
 const hash = x => createHash('sha256').update(x).digest('hex');
@@ -311,6 +313,8 @@ function ensureWelcome(v) {
 
 const app = express();
 app.disable('x-powered-by');
+app.enable('case sensitive routing');
+app.enable('strict routing');
 app.set('trust proxy', 'loopback');
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -319,8 +323,9 @@ app.use((req, res, next) => {
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
   res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
   if(req.path==='/'||req.path==='/index.html')res.setHeader('Cache-Control','no-cache, no-transform');
-  if (req.path.startsWith('/api/') || req.path.startsWith('/telegram/')) res.setHeader('Cache-Control', 'private, no-store, max-age=0');
-  if (['POST','PUT','PATCH','DELETE'].includes(req.method) && req.path.startsWith('/api/') && !requestOriginAllowed(req.headers,ALLOWED_ORIGINS)) {
+  const sensitive=/^\/(?:api|telegram)(?:\/|$)/i.test(req.path);
+  if (sensitive) res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+  if (['POST','PUT','PATCH','DELETE'].includes(req.method) && /^\/api(?:\/|$)/i.test(req.path) && !requestOriginAllowed(req.headers,ALLOWED_ORIGINS)) {
     console.warn('Request origin rejected:',JSON.stringify(originDiagnostic(req.headers)));
     return res.status(403).json({ error: '请求来源不正确' });
   }
@@ -364,24 +369,54 @@ app.get('/api/messages', requireVisitor, (req,res) => {
   ensureWelcome(req.visitor);
   res.json({ ...messageSnapshot(db,req.visitor.id,now()-DAY,publicMessage), serverTime: now() });
 });
-const upload = multer({ storage: multer.diskStorage({ destination: FILES, filename: (req,file,cb) => cb(null, randomUUID()) }), limits: { fileSize: MB20, files: 1, fields: 3, fieldSize: 20000 } });
+const diskStorage=multer.diskStorage({destination:FILES,filename:(req,file,cb)=>cb(null,randomUUID())});
+const upload=multer({
+ storage:{
+  _handleFile(req,file,cb){file.stream.on('data',chunk=>req.uploadPermit.record(chunk.length));diskStorage._handleFile(req,file,cb);},
+  _removeFile(req,file,cb){diskStorage._removeFile(req,file,cb);}
+ },
+ fileFilter(req,file,cb){
+  try{
+   const length=Number(req.headers['content-length']);
+   // Content-Length includes multipart overhead. Unknown/chunked bodies reserve
+   // a full file allowance; completion refunds only the unused reservation.
+   req.uploadPermit.startFile(Number.isSafeInteger(length)&&length>0?Math.min(MB20,length):MB20);
+   cb(null,true);
+  }catch(e){cb(e);}
+ },
+ limits:{fileSize:MB20,files:1,fields:3,fieldSize:20000,fieldNameSize:100,fieldArrayIndexLimit:0,parts:4}
+});
+function receiveUpload(req,res,next){
+ try{req.uploadPermit=uploadGuard.begin(req.visitor.id,req.ip);}catch(e){return next(e);}
+ const timeout=setTimeout(()=>req.destroy(Object.assign(new Error('上传超时'),{code:'UPLOAD_TIMEOUT'})),120000);
+ timeout.unref();
+ upload.single('file')(req,res,error=>{clearTimeout(timeout);if(error)req.uploadPermit.finish();next(error);});
+}
+
 app.post('/api/messages', requireVisitor, (req,res,next) => {
   if (!allowed(`send:${req.visitor.id}`, 40)) return res.status(429).json({ error: '消息发送过快，请稍后再试' });
   next();
-}, upload.single('file'), async (req,res,next) => {
+}, receiveUpload, async (req,res,next) => {
   const discard = () => { if(req.file) fs.rmSync(req.file.path, { force: true }); };
   try {
-    const clientId = String(req.body.clientId || '');
-    const text = String(req.body.text || '').trim();
+    if(typeof req.body?.clientId!=='string'||(req.body.text!==undefined&&typeof req.body.text!=='string')){
+      discard();return res.status(400).json({error:'消息格式不正确，请重试'});
+    }
+    const clientId = req.body.clientId;
+    const text = (req.body.text || '').trim();
     if (!/^[a-zA-Z0-9_-]{8,100}$/.test(clientId)) { discard(); return res.status(400).json({ error: '消息标识无效' }); }
     if (text.length > 4000) { discard(); return res.status(400).json({ error: '文字最多 4000 字' }); }
     if (!text && !req.file) return res.status(400).json({ error: '请输入消息或选择附件' });
     await locked(`submit:${req.visitor.id}:${clientId}`, async () => {
     const existing = sql('SELECT * FROM messages WHERE visitor_id=? AND client_id=?', req.visitor.id, clientId);
-    if (existing) { discard(); return res.json({ message: publicMessage(existing) }); }
+    if (existing) {
+      discard();
+      if(existing.revoked||existing.sent_at<=now()-DAY)return res.status(410).json({error:'消息已过期，不能重复发送'});
+      return res.json({message:publicMessage(existing)});
+    }
     if (req.file && (/^image\/(?:jpeg|png|gif|webp|avif|heic|heif)$/.test(req.file.mimetype) || /\.(?:jpe?g|png|gif|webp|avif|heic|heif)$/i.test(req.file.originalname))) {
       const original = req.file.path;
-      req.file = await locked('photo-conversion', () => prepareTelegramPhoto(req.file));
+      req.file = await convertPhoto(() => prepareTelegramPhoto(req.file));
       if (req.file.path !== original) fs.rmSync(original, { force: true });
     }
     let filename = req.file?.originalname;
@@ -397,7 +432,7 @@ app.post('/api/messages', requireVisitor, (req,res,next) => {
     publishMessage(id);
     res.status(201).json({ message: publicMessage(sql('SELECT * FROM messages WHERE id=?', id)) });
     });
-  } catch(e) { discard(); next(e); }
+  } catch(e) { discard(); next(e); } finally {req.uploadPermit.finish();}
 });
 app.post('/api/messages/:id/retry', requireVisitor, (req,res) => {
   if (!allowed(`retry:${req.visitor.id}`,10)) return res.status(429).json({error:'重试过于频繁，请稍后再试'});
@@ -442,13 +477,27 @@ app.get('/api/files/:id', requireVisitor, (req,res) => {
 app.use(express.static(path.join(HERE, 'public'), { maxAge: '1h', etag: true, setHeaders(res, file) { if(file.endsWith('.html')) res.setHeader('Cache-Control','no-cache, no-transform'); } }));
 app.use((err,req,res,next) => {
   if (res.headersSent) return next(err);
+  if(err.code==='UPLOAD_LIMIT'){res.setHeader('Retry-After',String(err.retryAfter||60));return res.status(err.status||429).json({error:err.message});}
   if (err instanceof multer.MulterError) return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? '单个附件不能超过 20 MB' : '附件上传失败，请重新选择' });
   if (err.code === 'INVALID_PHOTO') return res.status(400).json({ error: err.message });
   console.error('Request error:', err.name, err.code || 'internal');
   res.status(500).json({ error: '服务暂时繁忙，请稍后重试' });
 });
 
+let converting=0;
+async function convertPhoto(fn){
+ if(converting>=6)throw Object.assign(new Error('图片处理繁忙，请稍后再试'),{code:'UPLOAD_LIMIT',status:429,retryAfter:5});
+ converting++;
+ try{return await locked('photo-conversion',async()=>{
+  const release=uploadGuard.reserveStorage(64*1024*1024);
+  try{return await fn();}finally{release();}
+ });}finally{converting--;}
+}
 async function fetchFile(file) {
+ const release=uploadGuard.reserveStorage(MB20);
+ try{return await fetchFileReserved(file);}finally{release();}
+}
+async function fetchFileReserved(file) {
   if ((file.file_size || 0) > MB20) throw Object.assign(new Error('附件超过 20 MB，请发送较小的文件'),{permanent:true});
   const d = await telegram('getFile', { file_id: file.file_id });
   assertJobCurrent();
@@ -566,7 +615,7 @@ async function hydrateIncoming(m,p) {
   try {
     file=await fetchFile(JSON.parse(m.media_json));
     if(!currentVersion(m,p)) return;
-    if(m.kind==='image') preview=await locked('photo-conversion',() => createImagePreview({path:file.path,size:file.size,mimetype:m.mime,originalname:m.filename || '图片'}));
+    if(m.kind==='image') preview=await convertPhoto(() => createImagePreview({path:file.path,size:file.size,mimetype:m.mime,originalname:m.filename || '图片'}));
     if(!currentVersion(m,p)) return;
     run("UPDATE messages SET file_path=?,size=?,preview_path=?,preview_mime=?,file_status='ready',file_error=NULL WHERE id=? AND source_update=? AND revoked=0",file.path,file.size,preview?.path || null,preview?.mimetype || null,m.id,p.version);
     file=null;preview=null;
@@ -738,6 +787,7 @@ async function work() {
   } finally { dispatching=false; }
 }
 function cleanup() {
+  uploadGuard.prune();
   const cutoff = now()-7*DAY;
   const expired = db.prepare('SELECT file_path,preview_path FROM messages WHERE sent_at<? AND (file_path IS NOT NULL OR preview_path IS NOT NULL)').all(cutoff);
   for(const m of expired) for(const f of [m.file_path,m.preview_path]) if(f) fs.rmSync(f,{force:true});
