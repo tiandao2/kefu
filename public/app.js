@@ -2,6 +2,9 @@ const $ = id => document.getElementById(id);
 const list=$('message-list'),scroller=$('messages'),input=$('message-input'),sendButton=$('send-button');
 const messages=new Map(),pending=new Map(),visible=new Set(),reported=new Set();
 const rowCache=new Map();
+// Local revisions order HTTP snapshots against events received while in flight.
+const messageChanges=new Map(),removedMessages=new Set();
+let changeSequence=0,syncSequence=0,initializationSequence=0;
 let ready=false,selectedFile=null,sending=false,ws=null,reconnectDelay=1000,reconnectTimer=null,readTimer=null,toastTimer=null,serverOffset=0;
 const MAX=20*1024*1024,DAY=86400000;
 const clock=()=>Date.now()+serverOffset;
@@ -23,13 +26,14 @@ function updateSend(){sendButton.disabled=!ready||sending||(!input.value.trim()&
 function element(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e;}
 function timeLabel(ts){return new Intl.DateTimeFormat('zh-CN',{hour:'2-digit',minute:'2-digit',hour12:false}).format(ts);}
 function appendText(parent,text){if(!text)return;const e=element('div','message-text');e.textContent=text;parent.append(e);}
+const imageSource=m=>`${m.previewUrl||m.fileUrl+'?preview=1'}&v=${m.editedAt||m.sentAt}`;
 function createMessage(m){
  const own=m.direction==='visitor',row=element('article',`message${own?' own':''}${m.local?' pending':''}`);row.dataset.id=m.id;
  const main=element('div','message-main');main.append(element('div','message-sender',own?'您':m.direction==='welcome'?'在线客服 · 欢迎您':$('site-name').textContent));
  const bubble=element('div',`bubble${m.fileUrl&&['image','video'].includes(m.kind)?' media-bubble':''}`);
  if(m.fileUrl){
   if(m.kind==='image'&&['image/jpeg','image/png','image/gif','image/webp','image/avif'].includes(m.previewMime||m.mime)){
-   const image=element('img','message-image');image.src=`${m.previewUrl||m.fileUrl+'?preview=1'}&v=${m.editedAt||m.sentAt}`;image.alt=m.filename||'图片';image.loading='lazy';image.decoding='async';image.addEventListener('click',()=>openImage(m));image.addEventListener('load',()=>{if(clock()-m.sentAt<15000)bottom();});bubble.append(image);
+   const image=element('img','message-image');image.src=imageSource(m);image.alt=m.filename||'图片';image.loading='lazy';image.decoding='async';image.addEventListener('click',()=>openImage(m));image.addEventListener('load',()=>{if(clock()-m.sentAt<15000)bottom();scheduleReads();});bubble.append(image);
   }else if(m.kind==='video'){
    const video=element('video','message-video');video.src=`${m.fileUrl}?preview=1&v=${m.editedAt||m.sentAt}`;video.controls=true;video.preload='none';video.playsInline=true;bubble.append(video);
   }else{
@@ -69,40 +73,62 @@ function render(){
  while(cursor){const next=cursor.nextSibling;cursor.remove();cursor=next;}
  for(const [id,item]of rowCache)if(!keep.has(id)){observer.unobserve(item.node);visible.delete(id);item.node.remove();rowCache.delete(id);}
  scroller.scrollTop=Math.max(0,scroller.scrollHeight-before);
+ if($('image-dialog').open){
+  const current=messages.get($('image-dialog').dataset.id);
+  if(!current?.fileUrl||current.kind!=='image')$('image-dialog').close();
+  else if($('full-image').getAttribute('src')!==imageSource(current))$('full-image').src=imageSource(current);
+ }
 }
-function put(m){
- const existing=messages.get(m.id);messages.set(m.id,m);
+function put(m,observedAt=changeSequence){
+ if(removedMessages.has(m.id)||(messageChanges.get(m.id)||0)>observedAt)return;
+ const existing=messages.get(m.id);messages.set(m.id,m);messageChanges.set(m.id,++changeSequence);
  if(m.clientId)pending.delete(m.clientId);
  render();if(!existing)bottom();
 }
 async function sync(){
  if(!ready)return;
- const d=await api('/api/messages');serverOffset=d.serverTime-Date.now();
- const had=new Set(messages.keys());messages.clear();for(const m of d.messages){messages.set(m.id,m);if(m.clientId)pending.delete(m.clientId);}
+ const observedAt=changeSequence,request=++syncSequence;
+ const d=await api('/api/messages');if(request!==syncSequence)return;serverOffset=d.serverTime-Date.now();
+ const had=new Set(messages.keys()),received=new Set(d.messages.map(m=>m.id));
+ for(const id of had)if(!received.has(id)&&(messageChanges.get(id)||0)<=observedAt)removeMessage(id);
+ for(const m of d.messages){
+  if(removedMessages.has(m.id)||(messageChanges.get(m.id)||0)>observedAt)continue;
+  messages.set(m.id,m);messageChanges.set(m.id,++changeSequence);if(m.clientId)pending.delete(m.clientId);
+ }
  render();if(d.messages.some(m=>!had.has(m.id)))bottom();
+}
+function removeMessage(id){
+ messages.delete(id);reported.delete(id);removedMessages.add(id);messageChanges.set(id,++changeSequence);
+ if($('image-dialog').dataset.id===id)$('image-dialog').close();
 }
 function scheduleReads(){clearTimeout(readTimer);readTimer=setTimeout(markReads,200);}
 async function markReads(){
  if(document.visibilityState!=='visible'||!document.hasFocus()||$('image-dialog').open||!ready)return;
- const ids=[...visible].filter(id=>{const m=messages.get(id);return m?.direction==='staff'&&(m.kind==='text'||!m.fileStatus||m.fileStatus==='ready')&&!reported.has(id);});if(!ids.length)return;
+ const ids=[...visible].filter(id=>{const m=messages.get(id),image=rowCache.get(id)?.node.querySelector('img');return m?.direction==='staff'&&(m.kind==='text'||!m.fileStatus||m.fileStatus==='ready')&&(!image||(image.complete&&image.naturalWidth>0))&&!reported.has(id);});if(!ids.length)return;
  try{await api('/api/read',{ids});for(const id of ids)reported.add(id);}catch{readTimer=setTimeout(markReads,3000);}
 }
 function connect(){
- clearTimeout(reconnectTimer);if(ws)ws.close();
- ws=new WebSocket(`${location.protocol==='https:'?'wss:':'ws:'}//${location.host}/ws`);
- ws.onopen=()=>{reconnectDelay=1000;connection(true,'已连接 · 请留言咨询');sync().catch(()=>{});};
- ws.onmessage=event=>{try{const d=JSON.parse(event.data);if(d.type==='message')put(d.message);if(d.type==='remove'){messages.delete(d.id);reported.delete(d.id);if($('image-dialog').dataset.id===d.id)$('image-dialog').close();render();}}catch{}};
- ws.onclose=()=>{connection(false,navigator.onLine?'连接恢复中…':'网络已断开，等待恢复');reconnectTimer=setTimeout(connect,reconnectDelay+Math.random()*500);reconnectDelay=Math.min(30000,reconnectDelay*1.7);};
- ws.onerror=()=>ws.close();
+ clearTimeout(reconnectTimer);reconnectTimer=null;
+ if(ws&&(ws.readyState===WebSocket.OPEN||ws.readyState===WebSocket.CONNECTING)){
+  if(ws.readyState===WebSocket.OPEN)sync().catch(()=>{});
+  return;
+ }
+ const socket=new WebSocket(`${location.protocol==='https:'?'wss:':'ws:'}//${location.host}/ws`);ws=socket;
+ socket.onopen=()=>{if(ws!==socket)return;reconnectDelay=1000;connection(true,'已连接 · 请留言咨询');sync().catch(()=>{});};
+ socket.onmessage=event=>{if(ws!==socket)return;try{const d=JSON.parse(event.data);if(d.type==='message')put(d.message);if(d.type==='remove'){removeMessage(d.id);render();}}catch{}};
+ socket.onclose=()=>{if(ws!==socket)return;ws=null;connection(false,navigator.onLine?'连接恢复中…':'网络已断开，等待恢复');reconnectTimer=setTimeout(()=>{reconnectTimer=null;connect();},reconnectDelay+Math.random()*500);reconnectDelay=Math.min(30000,reconnectDelay*1.7);};
+ socket.onerror=()=>{if(ws===socket)socket.close();};
 }
 async function initialize(){
+ const request=++initializationSequence;
  $('loading-state').hidden=false;$('loading-state').classList.remove('failed');$('retry-connect').hidden=true;
  try{
   const getSession=()=>api('/api/session',{});
   const d=navigator.locks?await navigator.locks.request('kf-session',getSession):await getSession();
+  if(request!==initializationSequence)return;
   serverOffset=d.serverTime-Date.now();document.title=d.name;$('site-name').textContent=d.name;
   messages.clear();for(const m of d.messages)messages.set(m.id,m);ready=true;input.disabled=false;$('loading-state').hidden=true;render();bottom();updateSend();connect();
- }catch(e){connection(false,'暂时无法连接');$('loading-state').classList.add('failed');$('loading-state').querySelector('span:nth-child(2)').textContent=e.message;$('retry-connect').hidden=false;}
+ }catch(e){if(request!==initializationSequence)return;connection(false,'暂时无法连接');$('loading-state').classList.add('failed');$('loading-state').querySelector('span:nth-child(2)').textContent=e.message;$('retry-connect').hidden=false;}
 }
 function attachment(file){if(file&&file.size>MAX){toast('单个附件不能超过 20 MB');$('file-input').value='';return;}selectedFile=file||null;$('attachment-preview').hidden=!file;if(file){$('attachment-name').textContent=file.name;$('attachment-size').textContent=size(file.size);}updateSend();}
 function uploadMessage(item){return new Promise((resolve,reject)=>{
@@ -114,13 +140,14 @@ function uploadMessage(item){return new Promise((resolve,reject)=>{
 });}
 async function send(item){
  if(sending)return;sending=true;item.failed=false;pending.set(item.id,item);render();bottom();updateSend();
+ const observedAt=changeSequence;
  if(item.file){$('upload-progress').hidden=false;$('upload-bar').value=0;}
- try{const m=await uploadMessage(item);pending.delete(item.id);put(m);}
+ try{const m=await uploadMessage(item);pending.delete(item.id);put(m,observedAt);}
  catch(e){if(![...messages.values()].some(m=>m.clientId===item.id)){item.failed=true;pending.set(item.id,item);}render();toast(e.message);}
  finally{sending=false;$('upload-progress').hidden=true;updateSend();}
 }
 function retryPending(id){const item=pending.get(id);if(item)send(item);}
-async function retryStored(m,button){button.disabled=true;try{const d=await api(`/api/messages/${m.id}/retry`,{});put(d.message);}catch(e){toast(e.message);}finally{button.disabled=false;}}
+async function retryStored(m,button){button.disabled=true;const observedAt=changeSequence;try{const d=await api(`/api/messages/${m.id}/retry`,{});put(d.message,observedAt);}catch(e){toast(e.message);}finally{button.disabled=false;}}
 $('composer').addEventListener('submit',e=>{e.preventDefault();if(!ready||sending||(!input.value.trim()&&!selectedFile))return;const item={id:crypto.randomUUID(),clientId:null,direction:'visitor',kind:'text',body:input.value.trim(),file:selectedFile,filename:selectedFile?.name,size:selectedFile?.size,sentAt:clock(),local:true};input.value='';input.style.height='auto';attachment(null);$('file-input').value='';send(item);});
 input.addEventListener('input',()=>{input.style.height='auto';input.style.height=`${Math.min(input.scrollHeight,130)}px`;updateSend();if(document.activeElement===input)bottom();});
 input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();$('composer').requestSubmit();}});
@@ -129,7 +156,7 @@ $('file-input').addEventListener('change',()=>attachment($('file-input').files[0
 $('remove-attachment').addEventListener('click',()=>{attachment(null);$('file-input').value='';});
 input.addEventListener('paste',e=>{const file=[...e.clipboardData.items].find(i=>i.kind==='file')?.getAsFile();if(file){e.preventDefault();attachment(file);}});
 $('retry-connect').addEventListener('click',initialize);
-function openImage(m){$('image-dialog').dataset.id=m.id;$('full-image').src=`${m.previewUrl||m.fileUrl+'?preview=1'}&v=${m.editedAt||m.sentAt}`;$('image-dialog').showModal();}
+function openImage(m){$('image-dialog').dataset.id=m.id;$('full-image').src=imageSource(m);$('image-dialog').showModal();}
 $('close-image').addEventListener('click',()=>$('image-dialog').close());
 $('image-dialog').addEventListener('click',e=>{if(e.target===$('image-dialog'))$('image-dialog').close();});
 $('image-dialog').addEventListener('close',()=>{$('full-image').removeAttribute('src');scheduleReads();});

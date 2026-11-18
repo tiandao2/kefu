@@ -417,6 +417,48 @@ test('transient retry budget ends in visible failure instead of an endless loop'
  assert.equal(db.prepare("SELECT state FROM jobs WHERE kind='outgoing' AND json_extract(payload,'$.messageId')=?").get(m.id).state,'failed');
 });
 
+test('expired waiting tasks stop before delivery and no longer block a fresh message',async()=>{
+ const {s,v}=await freshVisitor(),id=`expired-${Date.now()}`,old=Date.now()-25*3600000;
+ db.transaction(()=>{
+  db.prepare("INSERT INTO messages(id,visitor_id,client_id,direction,kind,body,sent_at,status) VALUES(?,?,?,'visitor','text',?,?,'queued')").run(id,v.id,id,'expired-must-not-deliver',old);
+  db.prepare("INSERT INTO jobs(kind,payload,dedup,attempts,available_at,created_at,state,lane,category,retry_after_until,rate_limited_since) VALUES('outgoing',?,?,0,?,?,'pending',?,'send',?,?)").run(JSON.stringify({messageId:id}),`outgoing:${id}`,Date.now()+3600000,old,`send:${v.id}`,Date.now()+3600000,old);
+ })();
+ await until(()=>messageRow(id).status==='failed');
+ const job=db.prepare('SELECT * FROM jobs WHERE dedup=?').get(`outgoing:${id}`);
+ assert.equal(job.attempts,0);assert.ok(job.failed_at);assert.ok(!calls.some(c=>c.body.text==='expired-must-not-deliver'));
+ const next=await submit(s.cookie,`fresh-after-expiry-${Date.now()}`,'fresh-after-expiry');await until(()=>messageRow(next.id).status==='sent');
+});
+
+test('a deadline crossed while creating a topic prevents the following send',async()=>{
+ const {v}=await freshVisitor(),id=`expires-during-topic-${Date.now()}`;
+ db.prepare('UPDATE visitors SET topic_id=NULL WHERE id=?').run(v.id);
+ delays.set('createForumTopic',1400);
+ try{
+ db.transaction(()=>{
+  db.prepare("INSERT INTO messages(id,visitor_id,direction,kind,body,sent_at,status) VALUES(?,?,'visitor','text',?,?,'queued')").run(id,v.id,'must-not-send-after-topic-wait',Date.now());
+  db.prepare("INSERT INTO jobs(kind,payload,dedup,available_at,created_at,state,lane,category) VALUES('outgoing',?,?,0,?,'pending',?,'send')").run(JSON.stringify({messageId:id}),`outgoing:${id}`,Date.now()-86400000+1100,`send:${v.id}`);
+ })();
+ await until(()=>messageRow(id).status==='failed');assert.ok(!calls.some(c=>c.body.text==='must-not-send-after-topic-wait'));
+ assert.match(messageRow(id).failure_reason,/期限/);
+ }finally{delays.delete('createForumTopic');}
+});
+
+test('expiring a remaining caption preserves the successful remote file checkpoint',async()=>{
+ const {v}=await freshVisitor(),id=`expired-caption-${Date.now()}`,body='expired-long-caption-'.repeat(80),old=Date.now()-25*3600000;
+ db.transaction(()=>{
+  db.prepare("INSERT INTO messages(id,visitor_id,direction,kind,body,sent_at,status,tg_message_id,tg_topic_id) VALUES(?,?,'visitor','file',?,?,'delayed',77777,?)").run(id,v.id,body,old,v.topic_id);
+  db.prepare("INSERT INTO jobs(kind,payload,dedup,available_at,created_at,state,lane,category) VALUES('photo-caption',?,?,0,?,'pending',?,'send')").run(JSON.stringify({messageId:id}),`caption:${id}`,old,`send:${v.id}`);
+ })();
+ await until(()=>messageRow(id).status==='failed');assert.equal(messageRow(id).tg_message_id,77777);
+ assert.match(messageRow(id).failure_reason,/附件已送达/);assert.ok(!calls.some(c=>c.body.text===body));
+});
+
+test('old durable incoming metadata is reconciled rather than dropped as an expired send',async()=>{
+ const {v}=await freshVisitor(),payload={update_id:update++,message:staff(v.topic_id,11991,'late-durable-metadata')};
+ db.prepare("INSERT INTO jobs(kind,payload,dedup,available_at,created_at,state,lane,category) VALUES('update',?,?,0,?,'pending','metadata','metadata')").run(JSON.stringify(payload),`update:${payload.update_id}`,Date.now()-25*3600000);
+ await until(()=>staffMessage(11991)?.body==='late-durable-metadata');
+});
+
 test('parallel photo retries return one persisted message rather than a unique-key error',async()=>{
  const {s,v}=await freshVisitor(),bytes=await sharp(png).webp().toBuffer();
  const rs=await Promise.all([1,2].map(()=>arbitraryFile(s,'same-concurrent-photo','',bytes,'same.webp','image/webp')));

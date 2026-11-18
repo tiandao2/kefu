@@ -1,7 +1,7 @@
 import {chromium,webkit} from 'playwright';
 import {createServer} from 'node:http';
 import {spawn} from 'node:child_process';
-import {mkdtempSync,rmSync,readFileSync} from 'node:fs';
+import {mkdtempSync,rmSync,readFileSync,mkdirSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
@@ -9,6 +9,7 @@ import Database from 'better-sqlite3';
 import sharp from 'sharp';
 const dir=mkdtempSync(path.join(tmpdir(),'kf-browser-')),base='http://127.0.0.1:15311';
 const engineName=process.env.KF_BROWSER_ENGINE||'chromium';
+const screenshotDir=process.env.KF_SCREENSHOT_DIR||'/root/workspace-b/codex-outputs';mkdirSync(screenshotDir,{recursive:true});
 assert.ok(['chromium','webkit'].includes(engineName));
 let seq=100,topic=100,update=1,child,browser,db;
 const calls=[],errors=[];
@@ -136,7 +137,7 @@ try{
  await page.locator('#message-input').fill('键盘展开后输入第一行\n第二行\n第三行');await assertKeyboardLayout(400,160);
  await until(async()=>page.locator('#messages').evaluate(e=>e.scrollHeight-e.clientHeight-e.scrollTop<5));
  const staffBox=await page.getByText('输入时仍可看到这条客服回复',{exact:true}).boundingBox(),messagesBox=await page.locator('#messages').boundingBox();assert.ok(staffBox.y>=messagesBox.y&&staffBox.y+staffBox.height<=messagesBox.y+messagesBox.height,'latest staff response remains visible while typing');
- if(engineName==='chromium')await page.screenshot({path:'/root/workspace-b/codex-outputs/customer-keyboard-viewport.png',clip:{x:0,y:160,width:390,height:400}});
+ if(engineName==='chromium')await page.screenshot({path:path.join(screenshotDir,'customer-keyboard-viewport.png'),clip:{x:0,y:160,width:390,height:400}});
  await page.locator('#message-input').fill('键盘可见时发送测试');await page.locator('#send-button').click();
  await until(()=>calls.some(c=>c.body.text==='键盘可见时发送测试'&&!c.failed));await assertKeyboardLayout(400,160);
  await page.locator('#message-input').blur();await visualViewport(844);await assertKeyboardLayout(844);
@@ -150,9 +151,9 @@ try{
  await page.evaluate(()=>{for(const key of ['height','offsetTop','scale'])delete visualViewport[key];delete window.__keyboardViewport;visualViewport.dispatchEvent(new Event('resize'));});
  await until(async()=>page.evaluate(()=>Math.abs(document.querySelector('.chat-shell').getBoundingClientRect().height-visualViewport.height)<2));
  await page.locator('#messages').evaluate(e=>e.scrollTop=e.scrollHeight);await wait(150);
- if(engineName==='chromium')await page.screenshot({path:'/root/workspace-b/codex-outputs/customer-compact-mobile.png',fullPage:true});
+ if(engineName==='chromium')await page.screenshot({path:path.join(screenshotDir,'customer-compact-mobile.png'),fullPage:true});
  await page.setViewportSize({width:1280,height:900});await wait(150);
- if(engineName==='chromium')await page.screenshot({path:'/root/workspace-b/codex-outputs/customer-compact-desktop.png',fullPage:true});
+ if(engineName==='chromium')await page.screenshot({path:path.join(screenshotDir,'customer-compact-desktop.png'),fullPage:true});
  assert.equal(await page.locator('.message-avatar,#visitor-number,#download-image').count(),0);
  assert.deepEqual(errors,[]);
  console.log(`${engineName} browser checks passed: compact header (${header.height}px), relocated service note, keyboard resize/pan, multiline typing/sending, keyboard dismissal, preserved reading position, pinch zoom, landscape and 320px layouts; photo uploads/preview/edit/revoke, thumbs-up receipts and deleted-topic recovery.`);

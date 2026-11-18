@@ -57,7 +57,7 @@ curl -fsS http://127.0.0.1:3000/healthz
 
 更换机器人 Token 后，除了修改环境文件和重启，还必须重新调用 `setWebhook`，设置地址为 `PUBLIC_ORIGIN/telegram/webhook`、`secret_token` 为环境文件中的 `WEBHOOK_SECRET`，订阅 `message` 和 `edited_message`。不要将密钥写进公开源码或发到群里。
 
-服务由 systemd 自动启动和重启。每 5 分钟检查服务健康、磁盘使用率、长期重试任务，异常通过 Telegram 群提醒；同类提醒最多每小时一次。证书由 certbot 定期续期并自动重载 Nginx。
+服务由 systemd 自动启动和重启。每 5 分钟检查服务健康、磁盘使用率、待处理任务进展和新增终态失败。新增失败按发送、附件和辅助分类通知一次；同一任务人工重试后再次失败会形成新通知。持续异常最多每小时重复提醒，解除后发送恢复提醒。短时 retry_after 正常等待不告警，连续限流等待超过 15 分钟或任务无进展超过 10 分钟会提醒。告警发送失败返回非零退出码且不推进已通知状态。当前通知仍依赖 Telegram，同机检查不能替代独立外部监测。证书由 certbot 定期续期并自动重载 Nginx。
 
 ## 本地开发与测试
 
@@ -69,6 +69,8 @@ cp .env.example .env
 # 修改 .env
 node --env-file=.env server.mjs
 npm test
+node scripts/browser-reliability-check.mjs
+KF_BROWSER_ENGINE=webkit node scripts/browser-reliability-check.mjs
 # 浏览器测试使用本地模拟 Telegram，不会连接真实客服群
 npx playwright install chromium --with-deps
 node scripts/browser-check.mjs
@@ -113,7 +115,15 @@ nginx -t && systemctl reload nginx
 
 检测记录该诊断页的导航时间，并分三轮请求首页、CSS、JS 和健康接口。它不调用 `/api/session`、不建立 Telegram 话题、不发送聊天消息；资源请求不携带访客 Cookie。诊断页的首次导航和后续资源请求分别记录，后续连接复用不能代表冷启动速度。该页也不测量 DNS 导航开始前的浏览器界面延迟。
 
-检测版本 2 不依赖 `AbortSignal.timeout()`，通过显式定时器和可用时的 AbortController 管理请求及响应体超时；没有 AbortController 时仍能结束等待，但无法主动取消底层网络请求。报告包含浏览器能力、错误详情和失败阶段，复制时应保留完整内容。旧版的瞬时报错可能是方法不兼容，不能直接作为线路不可达的证据。客服前端 API 请求同步采用兼容超时处理，当前前端版本为 `app.js?v=7`。
+检测版本 2 不依赖 `AbortSignal.timeout()`，通过显式定时器和可用时的 AbortController 管理请求及响应体超时；没有 AbortController 时仍能结束等待，但无法主动取消底层网络请求。报告包含浏览器能力、错误详情和失败阶段，复制时应保留完整内容。旧版的瞬时报错可能是方法不兼容，不能直接作为线路不可达的证据。客服前端 API 请求同步采用兼容超时处理，当前前端版本为 `app.js?v=8`。
+
+## 1.0.1 可靠性更新
+
+客户端为请求和实时更新记录本页修订顺序，旧 HTTP 快照、上传或重试响应不能覆盖已经收到的新编辑、撤回及投递状态。网络恢复复用健康连接，旧连接的关闭/错误回调不能关闭新连接或安排额外重连。
+
+非入站元数据任务按创建时间在 24 小时后终止；调度扫描不等待 retry_after 到期，发起下一次 Telegram 请求前再次检查。已经发起的远端请求可能在截止后返回，不把它误认为尚未发送而盲目重发。入站元数据继续按现有版本和保留规则协调，不按发送任务期限丢弃。过期不会重置已成功的文件步骤，失败任务也不阻塞后续有效消息。人工重试保留原创建时间，并受消息 24 小时访问窗口限制。
+
+`jobs` 新增最后尝试、失败时间及限流时间字段，增量迁移保留原记录。当前仍须单应用进程运行，访客锁与活动队列在进程内。
 
 当前检测版本为 3，默认“复制简短结果”会复制约十余行摘要，包含检测编号、首屏 DNS/TCP/TLS、HTML 首字节与结束时间、首次绘制、四项请求范围及浏览器信息，便于手机转发。完整 JSON 仍在展开区保留，末尾也附带摘要，避免只复制最后一条健康请求而遗漏首屏数据。检测版本 3 继续使用上述兼容超时处理，不更改客服业务脚本。
 

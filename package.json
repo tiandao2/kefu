@@ -1,11 +1,12 @@
 {
   "name": "topic-customer-service",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "test:reliability": "node scripts/browser-reliability-check.mjs"
   },
   "engines": {
     "node": ">=22"

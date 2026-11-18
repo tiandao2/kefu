@@ -8,6 +8,7 @@ import { randomBytes, randomUUID, createHash, timingSafeEqual } from 'node:crypt
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { IP2Region } from 'ip2region/node';
 import { largestPhoto, prepareTelegramPhoto, createImagePreview } from './images.mjs';
 import { topicTitle, upgradeLegacyTopicTitle } from './topic-names.mjs';
@@ -17,6 +18,7 @@ import { topicTitle, upgradeLegacyTopicTitle } from './topic-names.mjs';
 setDefaultAutoSelectFamilyAttemptTimeout(1500);
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+const APP_VERSION=JSON.parse(fs.readFileSync(path.join(HERE,'package.json'),'utf8')).version;
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '127.0.0.1';
 const ORIGIN = process.env.PUBLIC_ORIGIN || 'http://localhost:3000';
@@ -32,6 +34,7 @@ const MB20 = 20 * 1024 * 1024;
 const DAY = 86400000;
 const WELCOME = '您好，欢迎来访本交易所，在线客服为您服务，请提供交易所账户，并发送您需要咨询的问题，谢谢！';
 const TG_BASE = process.env.TG_API_BASE || 'https://api.telegram.org';
+const jobContext=new AsyncLocalStorage();
 if (!BOT_TOKEN || !CHAT_ID || !SECRET || !STAFF_IDS.size) throw new Error('Missing bot, chat, staff or webhook configuration');
 fs.mkdirSync(FILES, { recursive: true, mode: 0o700 });
 const db = new Database(path.join(DATA, 'chat.sqlite'));
@@ -81,7 +84,7 @@ db.transaction(() => {
     caption_sent: 'INTEGER NOT NULL DEFAULT 0', caption_message_id: 'INTEGER'
   })) if (!messageColumns.has(name)) db.exec(`ALTER TABLE messages ADD COLUMN ${name} ${definition}`);
   const jobColumns = new Set(db.prepare('PRAGMA table_info(jobs)').all().map(c => c.name));
-  for (const [name, definition] of Object.entries({state: "TEXT NOT NULL DEFAULT 'pending'", lane: 'TEXT', category: 'TEXT'})) {
+  for (const [name, definition] of Object.entries({state: "TEXT NOT NULL DEFAULT 'pending'", lane: 'TEXT', category: 'TEXT',last_attempt_at:'INTEGER NOT NULL DEFAULT 0',failed_at:'INTEGER',retry_after_until:'INTEGER NOT NULL DEFAULT 0',rate_limited_since:'INTEGER NOT NULL DEFAULT 0'})) {
     if (!jobColumns.has(name)) db.exec(`ALTER TABLE jobs ADD COLUMN ${name} ${definition}`);
   }
   db.exec('UPDATE messages SET tg_topic_id=(SELECT topic_id FROM visitors WHERE visitors.id=messages.visitor_id) WHERE tg_message_id IS NOT NULL AND tg_topic_id IS NULL');
@@ -166,6 +169,7 @@ function publishMessage(id) {
   if (m && !m.revoked && m.sent_at > now() - DAY) broadcast(m.visitor_id, { type: 'message', message: publicMessage(m) });
 }
 async function telegram(method, body = {}, file) {
+  assertJobCurrent();
   if(now()<telegramPauseUntil){const e=new Error('Telegram 限流，等待恢复');e.retryAfter=Math.ceil((telegramPauseUntil-now())/1000);throw e;}
   let payload = body, headers = { 'Content-Type': 'application/json' };
   if (file) {
@@ -175,6 +179,7 @@ async function telegram(method, body = {}, file) {
     payload.append(method === 'sendPhoto' ? 'photo' : 'document', await openAsBlob(file.path, { type: file.mime || 'application/octet-stream' }), file.filename || '附件');
     headers = {};
   } else payload = JSON.stringify(body);
+  assertJobCurrent();
   const res = await fetch(`${TG_BASE}/bot${BOT_TOKEN}/${method}`, { method: 'POST', headers, body: payload, signal: AbortSignal.timeout(90000) });
   const data = await res.json();
   if (!data.ok) {
@@ -262,7 +267,7 @@ app.use((req, res, next) => {
   if (['POST','PUT','PATCH','DELETE'].includes(req.method) && req.path.startsWith('/api/') && !ALLOWED_ORIGINS.has(req.headers.origin)) return res.status(403).json({ error: '请求来源不正确' });
   next();
 });
-app.get('/healthz', (req,res) => res.json({ ok: true }));
+app.get('/healthz', (req,res) => res.json({ ok: true, version:APP_VERSION }));
 app.use(express.json({ limit: '1mb' }));
 app.post('/telegram/webhook', (req, res) => {
   if (!safeEqual(req.headers['x-telegram-bot-api-secret-token'], SECRET)) return res.sendStatus(403);
@@ -342,7 +347,7 @@ app.post('/api/messages/:id/retry', requireVisitor, (req,res) => {
   db.transaction(() => {
     // A retry never resets successful delivery steps or creates another message.
     for (const job of db.prepare("SELECT id,kind FROM jobs WHERE state='failed' AND json_extract(payload,'$.messageId')=?").all(m.id)) {
-      run("UPDATE jobs SET state='pending',attempts=0,last_error=NULL,available_at=? WHERE id=?",now(),job.id);
+      run("UPDATE jobs SET state='pending',attempts=0,last_error=NULL,failed_at=NULL,last_attempt_at=0,retry_after_until=0,rate_limited_since=0,available_at=? WHERE id=?",now(),job.id);
       if (job.kind==='outgoing' || job.kind==='photo-caption') run("UPDATE messages SET status='queued',failure_reason=NULL WHERE id=?",m.id);
       if (job.kind==='incoming-file' || job.kind==='photo-store') run("UPDATE messages SET file_status='pending',file_error=NULL WHERE id=?",m.id);
     }
@@ -387,6 +392,7 @@ app.use((err,req,res,next) => {
 async function fetchFile(file) {
   if ((file.file_size || 0) > MB20) throw Object.assign(new Error('附件超过 20 MB，请发送较小的文件'),{permanent:true});
   const d = await telegram('getFile', { file_id: file.file_id });
+  assertJobCurrent();
   const res = await fetch(`${TG_BASE}/file/bot${BOT_TOKEN}/${d.file_path}`, { signal: AbortSignal.timeout(90000) });
   if (!res.ok) { await res.body?.cancel(); throw Object.assign(new Error('附件下载失败'),{code:res.status}); }
   const dest = path.join(FILES, randomUUID());
@@ -577,12 +583,17 @@ async function processJob(job) {
 const activeJobs=new Map(), laneBusy=new Set();
 let stopping=false,dispatching=false;
 const CAPACITY={send:4,download:2,aux:2};
+function expiredJob(job) { return job && job.kind!=='update' && job.created_at<=now()-DAY; }
+function assertJobCurrent() {
+  if(expiredJob(jobContext.getStore()))throw Object.assign(new Error('任务已超过 24 小时处理期限'),{code:'TASK_EXPIRED',permanent:true});
+}
 function retryableError(e) {
   if(e.permanent || ['ENOENT','EACCES','INVALID_PHOTO'].includes(e.code)) return false;
   if(Number(e.code)===400 || Number(e.code)===401 || Number(e.code)===404) return false;
   return true;
 }
 function failureText(e,job,m) {
+  if(e.code==='TASK_EXPIRED')return m?.tg_message_id && !m.caption_sent && m.body.length>1024 ? '附件已送达，说明文字已超过投递期限' : '任务已超过 24 小时处理期限';
   if(Number(e.code)===403 || Number(e.code)===401) return '客服通道权限异常，请稍后重试或联系网站管理员';
   if(job.kind==='incoming-file' || job.kind==='photo-store') return e.code==='INVALID_PHOTO' ? '图片预览处理失败，请重试或改发 JPEG / PNG 图片' : '附件暂时无法加载，请点击重试';
   if(m?.tg_message_id && m.body.length>1024 && !m.caption_sent) return '附件已送达，说明文字发送失败，请点击重试';
@@ -594,17 +605,17 @@ function failJob(job,e) {
   const p=JSON.parse(job.payload),m=p.messageId && sql('SELECT * FROM messages WHERE id=?',p.messageId);
   if(job.kind==='incoming-file' && (!m || !currentVersion(m,p))) { run('DELETE FROM jobs WHERE id=?',job.id); return; }
   const limited=!!e.retryAfter || Number(e.code)===429;
-  const attempts=job.attempts+(limited?0:1);
+  const attempts=job.attempts+(limited||e.code==='TASK_EXPIRED'?0:1);
   const terminal=!retryableError(e) || attempts>=8 || job.created_at<now()-DAY;
   const delay=Math.max((e.retryAfter || (limited?1:0))*1000,Math.min(300000,1000*2**Math.min(attempts,8)));
   const error=String(e.message).replaceAll(BOT_TOKEN,'[redacted]').slice(0,200);
-  run('UPDATE jobs SET attempts=?,available_at=?,last_error=?,state=? WHERE id=?',attempts,now()+delay,error,terminal?'failed':'pending',job.id);
+  run('UPDATE jobs SET attempts=?,available_at=?,last_error=?,state=?,failed_at=?,retry_after_until=?,rate_limited_since=? WHERE id=?',attempts,now()+delay,error,terminal?'failed':'pending',terminal?now():null,limited?now()+Math.max(1000,e.retryAfter*1000||1000):0,limited?(job.rate_limited_since||now()):0,job.id);
   if(m && !m.revoked) {
     const reason=failureText(e,job,m);
     if(job.kind==='outgoing' || job.kind==='photo-caption') run('UPDATE messages SET status=?,failure_reason=? WHERE id=?',terminal?'failed':'delayed',terminal?reason:null,m.id);
     if(job.kind==='incoming-file' || job.kind==='photo-store') run('UPDATE messages SET file_status=?,file_error=? WHERE id=?',terminal?'failed':'delayed',terminal?reason:null,m.id);
     publishMessage(m.id);
-    if(terminal && job.kind==='incoming-file') queue('notice',{topicId:m.tg_topic_id,replyId:m.tg_message_id,text:`网页附件加载失败：${reason}`},`failed-file:${job.id}`);
+    if(terminal && job.kind==='incoming-file' && e.code!=='TASK_EXPIRED') queue('notice',{topicId:m.tg_topic_id,replyId:m.tg_message_id,text:`网页附件加载失败：${reason}`},`failed-file:${job.id}`);
   }
   if(terminal || attempts===1 || attempts%20===0) console.error(`Job ${job.id} (${job.kind}) ${terminal?'failed':'delayed'}:`,error.slice(0,160));
 }
@@ -613,6 +624,11 @@ async function work() {
   dispatching=true;
   try {
     migrateJobScopes();
+    // Expire waiting work even during a long retry_after pause. Metadata remains
+    // durable so late incoming updates can still be reconciled with retention.
+    for(const job of db.prepare("SELECT * FROM jobs WHERE state='pending' AND kind!='update' AND created_at<=?").all(now()-DAY)) {
+      if(!activeJobs.has(job.id))failJob(job,Object.assign(new Error('任务已超过 24 小时处理期限'),{code:'TASK_EXPIRED',permanent:true}));
+    }
     // Accept metadata immediately, even while Telegram is slow or rate limited.
     for(const job of db.prepare("SELECT * FROM jobs WHERE state='pending' AND category='metadata' AND available_at<=? ORDER BY id LIMIT 100").all(now())) {
       try { processUpdate(JSON.parse(job.payload));run('DELETE FROM jobs WHERE id=?',job.id); }
@@ -627,8 +643,9 @@ async function work() {
       for(const job of jobs) {
         if(count>=limit || now()<telegramPauseUntil) break;
         if(activeJobs.has(job.id) || laneBusy.has(job.lane)) continue;
+        run('UPDATE jobs SET last_attempt_at=? WHERE id=?',now(),job.id);
         count++;activeJobs.set(job.id,job);laneBusy.add(job.lane);
-        Promise.resolve().then(()=>processJob(job)).then(()=>run('DELETE FROM jobs WHERE id=?',job.id)).catch(e=>failJob(job,e)).finally(()=>{
+        Promise.resolve().then(()=>jobContext.run(job,()=>{assertJobCurrent();return processJob(job);})).then(()=>run('DELETE FROM jobs WHERE id=?',job.id)).catch(e=>failJob(job,e)).finally(()=>{
           activeJobs.delete(job.id);laneBusy.delete(job.lane);
           if(!stopping) setImmediate(()=>work().catch(e=>console.error('Worker failure:',e.name)));
         });
