@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>客服访问检测</title>
+  <script defer src="/network-check.js?v=3"></script>
+</head>
+<body>
+  <h1>客服访问检测</h1>
+  <p>这段说明显示出来，就表示检测页已到达浏览器。请记下此前白屏大约持续了多久。</p>
+  <p>请在出现慢加载的同一网络、同一浏览器中测试。检测不会创建客服话题或发送聊天消息。</p>
+  <p>更换 Wi-Fi／手机流量后，可重新打开此页再测；浏览器可能复用连接，报告会注明。</p>
+  <p><button id="start" type="button" disabled>开始检测</button> <button id="copy" type="button" disabled>复制简短结果</button></p>
+  <p id="status" role="status" aria-live="polite">正在加载检测程序；若这行一直不变，请连同现象告知客服。</p>
+  <p><label for="brief">简短结果（请整段发送）：</label></p>
+  <textarea id="brief" rows="12" cols="36" readonly aria-label="简短检测结果"></textarea>
+  <div id="summary"></div>
+  <p><a href="/">进入客服页面</a>（正常连接客服，沿用当前浏览器身份）</p>
+  <details><summary>查看完整结果</summary><p><button id="copy-full" type="button" disabled>复制完整 JSON</button></p><textarea id="report" rows="16" cols="36" readonly aria-label="完整检测结果"></textarea></details>
+  <p>结果仅包含本次加载时间、公开资源状态和浏览器环境，不包含聊天内容、Cookie 或访客凭据。通常发送简短结果即可，里面已包含首屏加载时间。</p>
+</body>
+</html>

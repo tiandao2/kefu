@@ -1,0 +1,27 @@
+[Unit]
+Description=Telegram Topic Customer Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kfchat
+Group=kfchat
+WorkingDirectory=/opt/kf-chat
+EnvironmentFile=/etc/kf-chat.env
+ExecStart=/usr/local/bin/node --max-old-space-size=384 /opt/kf-chat/server.mjs
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/kf-chat
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=768M
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

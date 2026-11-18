@@ -1,0 +1,10 @@
+[Unit]
+Description=Back up customer identity mapping without chat content
+[Service]
+Type=oneshot
+User=kfchat
+Group=kfchat
+WorkingDirectory=/opt/kf-chat
+EnvironmentFile=/etc/kf-chat.env
+ExecStart=/usr/local/bin/node /opt/kf-chat/scripts/backup-identities.mjs
+UMask=0077

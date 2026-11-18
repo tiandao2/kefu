@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#f7f8f6">
+  <meta name="description" content="在线客服，为您解答问题。">
+  <title>在线客服</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css?v=3">
+  <script type="module" src="/app.js?v=7"></script>
+</head>
+<body>
+  <main class="chat-shell">
+    <header class="header">
+      <div class="brand-mark" aria-hidden="true"><svg viewBox="0 0 32 32" fill="none"><path d="M7 17v-2a9 9 0 0 1 18 0v2M7 16H5v7h5v-7H7Zm18 0h2v7h-5v-7h3Zm0 7c0 3-3 4-7 4" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M14 26h5" stroke="currentColor" stroke-width="3" stroke-linecap="round"/></svg></div>
+      <div class="brand-copy"><h1 id="site-name">在线客服</h1><p><span class="status-dot" id="status-dot"></span><span id="connection-label" role="status">正在连接…</span></p></div>
+      <div class="private-group"><div class="private-tag"><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="m10 2 6 2.5V10c0 4-6 7-6 7s-6-3-6-7V4.5L10 2Z" stroke="currentColor" stroke-width="1.5"/><path d="m7 9 2 2 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg><span>专属会话</span></div><p class="service-note">很高兴为您服务</p></div>
+    </header>
+    <section class="messages" id="messages" aria-label="聊天记录" tabindex="0">
+      <div class="conversation-start" id="conversation-start"><span class="start-line"></span><span>每一次沟通，都认真对待</span><span class="start-line"></span></div>
+      <div id="message-list" role="log" aria-live="polite" aria-relevant="additions text"></div>
+      <div class="loading-state" id="loading-state"><span class="loading-ring"></span><span>正在为您连接客服</span><button id="retry-connect" class="text-button" hidden>重新连接</button></div>
+    </section>
+    <div class="composer-wrap">
+      <div class="attachment-preview" id="attachment-preview" hidden><span class="attachment-icon">↗</span><div><strong id="attachment-name"></strong><small id="attachment-size"></small></div><button id="remove-attachment" type="button" aria-label="移除附件">×</button></div>
+      <div class="upload-progress" id="upload-progress" hidden><progress id="upload-bar" max="100" value="0"></progress><span id="upload-label">上传中</span></div>
+      <form class="composer" id="composer">
+        <input type="file" id="file-input" hidden>
+        <button type="button" id="attach-button" class="icon-button" aria-label="添加图片、视频或文件" title="添加附件，最大 20 MB"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m8 12 6.8-6.8a3.5 3.5 0 0 1 5 5L10 20a5 5 0 0 1-7-7L13 3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        <textarea id="message-input" rows="1" maxlength="4000" enterkeyhint="send" placeholder="请输入您想咨询的问题…" aria-label="消息内容" disabled></textarea>
+        <button type="submit" id="send-button" class="send-button" aria-label="发送消息" disabled><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg><span>发送</span></button>
+      </form>
+      <p class="composer-note">支持图片、视频及文件 · 单个不超过 20 MB</p>
+    </div>
+    <div id="toast" class="toast" role="alert" hidden></div>
+    <dialog id="image-dialog" class="image-dialog"><button id="close-image" aria-label="关闭预览">×</button><img id="full-image" alt="图片预览"></dialog>
+  </main>
+</body>
+</html>

@@ -1,0 +1,14 @@
+[Unit]
+Description=Customer service health and storage monitor
+After=kf-chat.service
+[Service]
+Type=oneshot
+User=kfchat
+Group=kfchat
+WorkingDirectory=/opt/kf-chat
+EnvironmentFile=/etc/kf-chat.env
+ExecStart=/usr/local/bin/node /opt/kf-chat/scripts/monitor.mjs
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/kf-chat
