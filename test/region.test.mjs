@@ -7,7 +7,7 @@ import {tmpdir} from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 
-const data=mkdtempSync(path.join(tmpdir(),'kf-region-')),calls=[],modes=new Map(),names=new Map();
+const data=mkdtempSync(path.join(tmpdir(),'kf-region-')),calls=[],modes=new Map(),names=new Map(),deletedTopics=new Set();
 let mock,base,child,db,topic=100,seq=1000,update=100,logs='',blockingTopic,releaseEdit,editStarted=false,failedRestoreTitle;
 const wait=ms=>new Promise(r=>setTimeout(r,ms));
 async function until(fn,timeout=12000){const start=Date.now();while(Date.now()-start<timeout){const result=await fn();if(result)return result;await wait(30);}throw Error('Timed out '+logs.slice(-500));}
@@ -19,7 +19,9 @@ async function start(){
 }
 async function stop(){if(child?.exitCode===null){const ended=new Promise(r=>child.once('exit',r));child.kill('SIGTERM');await ended;}}
 async function session(ip){const r=await fetch(base+'/api/session',{method:'POST',headers:{Origin:base,'Content-Type':'application/json','X-Forwarded-For':ip},body:'{}'});assert.equal(r.status,200);const body=await r.json();return {cookie:r.headers.get('set-cookie').split(';')[0],v:db.prepare('SELECT * FROM visitors WHERE number=?').get(Number(body.number))};}
-async function hook(v,name,bot=false){const r=await fetch(base+'/telegram/webhook',{method:'POST',headers:{'Content-Type':'application/json','X-Telegram-Bot-Api-Secret-Token':'region-secret'},body:JSON.stringify({update_id:update++,message:{message_id:seq++,message_thread_id:v.topic_id,chat:{id:-100123},from:{id:bot?123:42,is_bot:bot},date:Math.floor(Date.now()/1000),forum_topic_edited:{name}}})});assert.equal(r.status,200);}
+async function hook(v,name,bot=false,{id=update++,date=Math.floor(Date.now()/1000)}={}){const r=await fetch(base+'/telegram/webhook',{method:'POST',headers:{'Content-Type':'application/json','X-Telegram-Bot-Api-Secret-Token':'region-secret'},body:JSON.stringify({update_id:id,message:{message_id:seq++,message_thread_id:v.topic_id,chat:{id:-100123},from:{id:bot?123:42,is_bot:bot},date,forum_topic_edited:{name}}})});assert.equal(r.status,200);await until(()=>!db.prepare('SELECT 1 FROM jobs WHERE dedup=?').get(`update:${id}`));}
+async function sendText(cookie,clientId){const form=new FormData();form.set('clientId',clientId);form.set('text',clientId);const r=await fetch(base+'/api/messages',{method:'POST',headers:{Origin:base,Cookie:cookie},body:form});assert.equal(r.status,201);return(await r.json()).message;}
+const sent=id=>db.prepare('SELECT * FROM messages WHERE id=? AND status=?').get(id,'sent');
 const visitor=id=>db.prepare('SELECT * FROM visitors WHERE id=?').get(id);
 const regionDone=id=>!db.prepare("SELECT 1 FROM jobs WHERE kind='region' AND json_extract(payload,'$.visitorId')=?").get(id);
 before(async()=>{
@@ -33,11 +35,14 @@ before(async()=>{
     if(provider==='ipwho.is'){assert.equal(req.headers.token,undefined);assert.equal(url.searchParams.get('lang'),'zh-CN');res.setHeader('Content-Type','application/json');res.end(JSON.stringify({success:true,ip,country:'中国',region:'浙江',city:'杭州'}));return;}
     res.setHeader('Content-Type','text/html');res.end(`<table><tr><th>您查询的IP</th><td><span>${ip}</span></td></tr><tr><th>所在地理位置</th><td><span>中国 浙江 杭州</span></td></tr></table>`);return;
    }
-   const chunks=[];for await(const c of req)chunks.push(c);const body=chunks.length?JSON.parse(Buffer.concat(chunks)):{};
+   const chunks=[];for await(const c of req)chunks.push(c);const raw=Buffer.concat(chunks);
+   const body=req.headers['content-type']?.startsWith('multipart/form-data')?Object.fromEntries(await new Response(raw,{headers:{'Content-Type':req.headers['content-type']}}).formData()):raw.length?JSON.parse(raw):{};
    const method=req.url.split('/').pop();calls.push({method,body});let result=true;
+   if(deletedTopics.has(Number(body.message_thread_id))&&method!=='editForumTopic'){res.setHeader('Content-Type','application/json');res.end(JSON.stringify({ok:false,error_code:400,description:'Bad Request: message thread not found'}));return;}
    if(method==='createForumTopic'){result={message_thread_id:++topic,name:body.name};names.set(topic,body.name);}
    else if(method==='editForumTopic'){
     if(body.message_thread_id===blockingTopic){blockingTopic=null;editStarted=true;await new Promise(r=>releaseEdit=r);}
+    if(deletedTopics.has(body.message_thread_id)){res.setHeader('Content-Type','application/json');res.end(JSON.stringify({ok:false,error_code:400,description:'Bad Request: message thread not found'}));return;}
     if(body.name===failedRestoreTitle){failedRestoreTitle=null;res.setHeader('Content-Type','application/json');res.end(JSON.stringify({ok:false,error_code:500,description:'fixture restore failure'}));return;}
     names.set(body.message_thread_id,body.name);
    }else result={message_id:++seq};
@@ -96,4 +101,73 @@ test('failed compensation remains durable and retries the manual title instead o
  assert.equal(job.state,'pending');assert.equal(visitor(v.id).title,'人工名称需要重试');
  db.prepare('UPDATE jobs SET available_at=0 WHERE id=?').run(job.id);
  await until(()=>names.get(current.topic_id)==='人工名称需要重试'&&!db.prepare('SELECT 1 FROM jobs WHERE id=?').get(job.id));
+});
+
+test('text and attachment delivery finish while automatic topic editing is held for five seconds',async()=>{
+ const ip='8.8.8.1';modes.set(ip,{delay:400});const {v,cookie}=await session(ip);const original=await until(()=>visitor(v.id).topic_id&&visitor(v.id));
+ blockingTopic=original.topic_id;editStarted=false;await until(()=>editStarted);const began=Date.now();
+ try{
+  const message=await sendText(cookie,'send-during-auto-rename');await until(()=>sent(message.id),1800);
+  const form=new FormData();form.set('clientId','file-during-auto-rename');form.set('file',new Blob(['test attachment'],{type:'text/plain'}),'notes.txt');
+  const r=await fetch(base+'/api/messages',{method:'POST',headers:{Origin:base,Cookie:cookie},body:form});assert.equal(r.status,201);const attachment=(await r.json()).message;
+  await until(()=>sent(attachment.id),1800);assert.equal(visitor(v.id).topic_id,original.topic_id);assert.equal(visitor(v.id).token_hash,original.token_hash);
+  assert.ok(calls.some(c=>c.method==='sendDocument'&&Number(c.body.message_thread_id)===original.topic_id));
+  await wait(Math.max(0,5000-(Date.now()-began)));
+ }finally{releaseEdit?.();releaseEdit=null;}
+ await until(()=>regionDone(v.id));assert.equal(visitor(v.id).title,`${v.number}-浙江杭州`);
+});
+
+test('manual title restoration does not block messages and follows a newer manual rename',async()=>{
+ const {v,cookie}=await session('9.9.9.1');await until(()=>regionDone(v.id));const current=visitor(v.id);
+ blockingTopic=current.topic_id;editStarted=false;db.prepare('UPDATE visitors SET pending_title=? WHERE id=?').run('自动改名在途',v.id);
+ names.set(current.topic_id,'第一人工名');await hook(current,'第一人工名');await until(()=>editStarted);
+ try{
+  const message=await sendText(cookie,'send-during-manual-restore');await until(()=>sent(message.id),1800);
+  names.set(current.topic_id,'最新人工名');await hook(current,'最新人工名');assert.equal(visitor(v.id).title,'最新人工名');
+ }finally{releaseEdit?.();releaseEdit=null;}
+ await until(()=>names.get(current.topic_id)==='最新人工名'&&!db.prepare("SELECT 1 FROM jobs WHERE kind='restore-title' AND json_extract(payload,'$.visitorId')=?").get(v.id));
+ assert.equal(visitor(v.id).auto_title,null);
+});
+
+test('deleted topic is rebuilt without waiting for an old automatic rename response',async()=>{
+ const ip='8.8.8.2';modes.set(ip,{delay:400});const {v,cookie}=await session(ip);const original=await until(()=>visitor(v.id).topic_id&&visitor(v.id));
+ blockingTopic=original.topic_id;editStarted=false;await until(()=>editStarted);deletedTopics.add(original.topic_id);
+ try{
+  const message=await sendText(cookie,'send-after-topic-deletion');await until(()=>sent(message.id),1800);
+  const current=visitor(v.id);assert.notEqual(current.topic_id,original.topic_id);assert.equal(sent(message.id).tg_topic_id,current.topic_id);
+  assert.equal(current.token_hash,original.token_hash);assert.equal(calls.filter(c=>c.method==='createForumTopic'&&c.body.name.startsWith(`${v.number}-`)).length,2);
+ }finally{releaseEdit?.();releaseEdit=null;}
+ await until(()=>regionDone(v.id));const current=visitor(v.id);assert.equal(current.title,`${v.number}-浙江杭州`);assert.equal(names.get(current.topic_id),current.title);
+});
+
+test('old and same-second manual rename notifications never overwrite the newest name or its protection',async()=>{
+ const {v}=await session('9.9.9.2');await until(()=>regionDone(v.id));const current=visitor(v.id),date=Math.floor(Date.now()/1000);
+ names.set(current.topic_id,'最新人工名称');await hook(current,'最新人工名称',false,{id:9002,date});
+ await hook(current,'旧人工名称',false,{id:9001,date:date-1});assert.equal(visitor(v.id).title,'最新人工名称');
+ await hook(current,'同秒较早名称',false,{id:9000,date});assert.equal(visitor(v.id).title,'最新人工名称');
+ await hook(current,'同秒更新名称',false,{id:9003,date});assert.equal(visitor(v.id).title,'同秒更新名称');
+ await hook(current,'重复通知不应改名',false,{id:9003,date});assert.equal(visitor(v.id).title,'同秒更新名称');
+ await hook(current,`${v.number}-浙江杭州`,true,{id:9004,date:date+1});assert.equal(visitor(v.id).title,'同秒更新名称');assert.equal(visitor(v.id).auto_title,null);
+ await stop();await start();await hook(current,'重启后晚到的旧名称',false,{id:9005,date:date-1});assert.equal(visitor(v.id).title,'同秒更新名称');
+});
+
+test('newer manual intent survives an older notification and bot echo during an automatic edit',async()=>{
+ const ip='8.8.8.3';modes.set(ip,{delay:400});const {v}=await session(ip);const current=await until(()=>visitor(v.id).topic_id&&visitor(v.id));
+ blockingTopic=current.topic_id;editStarted=false;await until(()=>editStarted);const date=Math.floor(Date.now()/1000);
+ try{
+  names.set(current.topic_id,'最新的人工备注');await hook(current,'最新的人工备注',false,{id:9012,date});
+  await hook(current,'过期的人工备注',false,{id:9011,date:date-1});await hook(current,`${v.number}-浙江杭州`,true,{id:9013,date:date+1});
+  assert.equal(visitor(v.id).title,'最新的人工备注');assert.equal(visitor(v.id).auto_title,null);
+ }finally{releaseEdit?.();releaseEdit=null;}
+ await until(()=>regionDone(v.id)&&names.get(current.topic_id)==='最新的人工备注');assert.equal(visitor(v.id).title,'最新的人工备注');
+});
+
+test('new topic bindings and later timestamps accept lower update ids',async()=>{
+ const {v,cookie}=await session('192.168.1.9');const original=await until(()=>visitor(v.id).topic_id&&visitor(v.id)),date=Math.floor(Date.now()/1000);
+ names.set(original.topic_id,'原话题人工名称');await hook(original,'原话题人工名称',false,{id:10000,date:date-8*86400});
+ names.set(original.topic_id,'一周后的人工名称');await hook(original,'一周后的人工名称',false,{id:1000,date});assert.equal(visitor(v.id).title,'一周后的人工名称');
+ deletedTopics.add(original.topic_id);const message=await sendText(cookie,'rebuild-manual-topic');await until(()=>sent(message.id));const current=visitor(v.id);
+ assert.notEqual(current.topic_id,original.topic_id);assert.equal(names.get(current.topic_id),'一周后的人工名称');
+ names.set(current.topic_id,'新话题独立人工名称');await hook(current,'新话题独立人工名称',false,{id:999,date:date-1});assert.equal(visitor(v.id).title,'新话题独立人工名称');
+ await hook(original,'旧话题晚到通知',false,{id:10001,date:date+1});assert.equal(visitor(v.id).title,'新话题独立人工名称');
 });

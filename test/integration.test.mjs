@@ -493,13 +493,15 @@ test('legacy database migrates without losing identity and 7-day cleanup preserv
  const original=db.prepare('SELECT * FROM visitors WHERE id=?').get(file.visitor_id);
  db.prepare('UPDATE messages SET sent_at=? WHERE id=?').run(Date.now()-8*86400000,file.id);
  child.kill('SIGTERM');await new Promise(r=>child.once('exit',r));
- db.exec('DROP TRIGGER message_state_insert; DROP TRIGGER message_state_update; DROP TRIGGER message_state_delete; ALTER TABLE messages DROP COLUMN tg_topic_id; ALTER TABLE messages DROP COLUMN is_photo;');
+ db.exec('DROP TRIGGER message_state_insert; DROP TRIGGER message_state_update; DROP TRIGGER message_state_delete; ALTER TABLE messages DROP COLUMN tg_topic_id; ALTER TABLE messages DROP COLUMN is_photo; ALTER TABLE visitors DROP COLUMN title_source_date; ALTER TABLE visitors DROP COLUMN title_source_update;');
  child=spawn(process.execPath,['server.mjs'],{env:{...process.env,PORT:'15301',HOST:'127.0.0.1',PUBLIC_ORIGIN:origin,ALLOWED_ORIGINS:' https://alternate.example , ',BOT_TOKEN:'test-token',TG_CHAT_ID:'-100123',STAFF_IDS:'42,43',WEBHOOK_SECRET:'test-secret',DATA_DIR:data,TG_API_BASE:'http://127.0.0.1:15302',NODE_ENV:'test',GEO_ENABLED:'0'},stdio:['ignore','pipe','pipe']});
  child.stdout.on('data',d=>logs+=d);child.stderr.on('data',d=>logs+=d);
  await until(async()=>{try{return(await fetch(base+'/healthz')).ok;}catch{return false;}});
  assert.equal(db.prepare('SELECT id FROM messages WHERE id=?').get(file.id),undefined);
  const {existsSync}=await import('node:fs');assert.equal(existsSync(file.file_path),false);
- assert.equal(db.prepare('SELECT topic_id FROM visitors WHERE id=?').get(original.id).topic_id,original.topic_id);
+ const migrated=db.prepare('SELECT * FROM visitors WHERE id=?').get(original.id);
+ for(const key of ['id','number','token_hash','topic_id','title','auto_title'])assert.equal(migrated[key],original[key]);
+ assert.equal(migrated.title_source_date,0);assert.equal(migrated.title_source_update,0);
  const columns=db.prepare('PRAGMA table_info(messages)').all().map(c=>c.name);assert.ok(columns.includes('tg_topic_id'));assert.ok(columns.includes('is_photo'));
  const retained=db.prepare('SELECT * FROM messages WHERE tg_message_id=10101').get();assert.ok(retained);assert.equal(retained.tg_topic_id,db.prepare('SELECT topic_id FROM visitors WHERE id=?').get(retained.visitor_id).topic_id);
 });

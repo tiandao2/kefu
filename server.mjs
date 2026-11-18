@@ -91,7 +91,9 @@ db.transaction(() => {
   }
   db.exec('UPDATE messages SET tg_topic_id=(SELECT topic_id FROM visitors WHERE visitors.id=messages.visitor_id) WHERE tg_message_id IS NOT NULL AND tg_topic_id IS NULL');
   const visitorColumns=new Set(db.prepare('PRAGMA table_info(visitors)').all().map(c=>c.name));
-  for(const column of ['auto_title','pending_title'])if(!visitorColumns.has(column))db.exec(`ALTER TABLE visitors ADD COLUMN ${column} TEXT`);
+  for(const [column,definition] of Object.entries({auto_title:'TEXT',pending_title:'TEXT',title_source_date:'INTEGER NOT NULL DEFAULT 0',title_source_update:'INTEGER NOT NULL DEFAULT 0'})) {
+    if(!visitorColumns.has(column))db.exec(`ALTER TABLE visitors ADD COLUMN ${column} ${definition}`);
+  }
 })();
 initializeMessageState(db);
 
@@ -214,7 +216,7 @@ async function ensureTopic(v, ip, obsoleteTopic = null) {
   return locked(`topic:${v.id}`, async () => {
     let fresh = sql('SELECT * FROM visitors WHERE id=?', v.id);
     if (obsoleteTopic !== null && fresh.topic_id === obsoleteTopic) {
-      run('UPDATE visitors SET topic_id=NULL WHERE id=? AND topic_id=?', v.id, obsoleteTopic);
+      run('UPDATE visitors SET topic_id=NULL,pending_title=NULL,title_source_date=0,title_source_update=0 WHERE id=? AND topic_id=?', v.id, obsoleteTopic);
       fresh.topic_id = null;
     }
     if (fresh.topic_id) return fresh;
@@ -223,7 +225,7 @@ async function ensureTopic(v, ip, obsoleteTopic = null) {
     const title = fresh.title ? upgradeLegacyTopicTitle(fresh.number, fresh.title) : topicTitle(fresh.number,'未知地区');
     const topic = await telegram('createForumTopic', { chat_id: CHAT_ID, name: title });
     db.transaction(() => {
-      run('UPDATE visitors SET topic_id=?,title=?,auto_title=? WHERE id=?', topic.message_thread_id, title, automatic?title:null, v.id);
+      run('UPDATE visitors SET topic_id=?,title=?,auto_title=?,pending_title=NULL,title_source_date=0,title_source_update=0 WHERE id=?', topic.message_thread_id, title, automatic?title:null, v.id);
       // Wake messages that were already waiting on this visitor's old topic.
       run("UPDATE jobs SET available_at=? WHERE kind IN ('outgoing','welcome') AND json_extract(payload,'$.messageId') IN (SELECT id FROM messages WHERE visitor_id=?)", now(), v.id);
     })();
@@ -236,17 +238,32 @@ async function completeRegion(p) {
   if(!automatic(sql('SELECT * FROM visitors WHERE id=?',p.visitorId)))return;
   const location=await region(p.ip);
   if(location==='未知地区')throw new Error('归属地服务暂时不可用');
-  return locked(`topic:${p.visitorId}`,async()=>{
-    let v=sql('SELECT * FROM visitors WHERE id=?',p.visitorId);
-    if(!automatic(v))return;
-    const title=topicTitle(v.number,location);
-    if(title===v.title)return;
-    if(!v.topic_id){run('UPDATE visitors SET title=?,auto_title=? WHERE id=?',title,title,v.id);return;}
-    run('UPDATE visitors SET pending_title=? WHERE id=?',title,v.id);
+  return locked(`topic-title:${p.visitorId}`,async()=>{
+    // Wait for a topic being created, but release its lock before editing the
+    // name remotely. Existing-topic sends and deleted-topic recovery stay free.
+    const edit=await locked(`topic:${p.visitorId}`,()=>{
+      const v=sql('SELECT * FROM visitors WHERE id=?',p.visitorId);
+      if(!automatic(v))return;
+      const title=topicTitle(v.number,location);
+      if(title===v.title)return;
+      if(!v.topic_id){run('UPDATE visitors SET title=?,auto_title=? WHERE id=?',title,title,v.id);return;}
+      run('UPDATE visitors SET pending_title=? WHERE id=?',title,v.id);
+      return {v,title};
+    });
+    if(!edit)return;
+    const {v,title}=edit;
     try{
+      let error;
       try{await telegram('editForumTopic',{chat_id:CHAT_ID,message_thread_id:v.topic_id,name:title});}
-      catch(e){if(!(Number(e.code)===400&&/not[_ ]modified/i.test(e.message)))throw e;}
+      catch(e){if(!(Number(e.code)===400&&/not[_ ]modified/i.test(e.message)))error=e;}
       const current=sql('SELECT * FROM visitors WHERE id=?',v.id);
+      // The binding can now be replaced while the old edit is in flight. Its
+      // success or missing-topic error must not finalize the new topic's name.
+      if(current?.topic_id!==v.topic_id){
+        if(automatic(current))throw new Error('话题已更新，等待地区补全');
+        return;
+      }
+      if(error)throw error;
       // A manual rename can arrive while the Telegram request is in flight.
       // Preserve it locally and restore it remotely if our edit crossed it.
       if(!automatic(current)){
@@ -254,12 +271,12 @@ async function completeRegion(p) {
         return;
       }
       run('UPDATE visitors SET title=?,auto_title=? WHERE id=?',title,title,v.id);
-    }finally{run('UPDATE visitors SET pending_title=NULL WHERE id=? AND pending_title=?',v.id,title);}
+    }finally{run('UPDATE visitors SET pending_title=NULL WHERE id=? AND topic_id=? AND pending_title=?',v.id,v.topic_id,title);}
   });
 }
 async function restoreManualTitle(p) {
-  return locked(`topic:${p.visitorId}`,async()=>{
-    const v=sql('SELECT * FROM visitors WHERE id=?',p.visitorId);
+  return locked(`topic-title:${p.visitorId}`,async()=>{
+    const v=await locked(`topic:${p.visitorId}`,()=>sql('SELECT * FROM visitors WHERE id=?',p.visitorId));
     if(!v||v.topic_id!==p.topicId||!v.title||v.auto_title!==null)return;
     try{await telegram('editForumTopic',{chat_id:CHAT_ID,message_thread_id:v.topic_id,name:v.title});}
     catch(e){if(missingTopic(e))return;if(!(Number(e.code)===400&&/not[_ ]modified/i.test(e.message)))throw e;}
@@ -455,13 +472,18 @@ function processUpdate(update) {
   if(m.forum_topic_edited?.name) {
     const name=m.forum_topic_edited.name;
     const ownBot=m.from?.is_bot&&String(m.from.id)===BOT_TOKEN.split(':')[0];
-    if(ownBot){
-      if(name===v.pending_title||name===v.auto_title)run('UPDATE visitors SET title=?,auto_title=? WHERE id=?',name,name,v.id);
-    }else db.transaction(()=>{
-      run('UPDATE visitors SET title=?,auto_title=NULL,pending_title=NULL WHERE id=?',name,v.id);
+    // Our API responses finalize automatic edits. Their delayed echoes must
+    // neither restore automation nor advance the manual-name event watermark.
+    if(ownBot)return;
+    const date=Number(m.edit_date||m.date);
+    if(!Number.isSafeInteger(date)||date<=0)return;
+    db.transaction(()=>{
+      const current=sql('SELECT * FROM visitors WHERE id=? AND topic_id=?',v.id,m.message_thread_id);
+      if(!current||date<current.title_source_date||(date===current.title_source_date&&update.update_id<=current.title_source_update))return;
+      run('UPDATE visitors SET title=?,auto_title=NULL,pending_title=NULL,title_source_date=?,title_source_update=? WHERE id=?',name,date,update.update_id,v.id);
       // Save compensation before the in-flight automatic edit can finish or
-      // the process can restart. The topic lock orders the actual requests.
-      if(v.pending_title)queue('restore-title',{visitorId:v.id,topicId:v.topic_id},`restore-title:${v.id}:${v.topic_id}`);
+      // the process can restart. The title lock orders the actual requests.
+      if(current.pending_title)queue('restore-title',{visitorId:v.id,topicId:v.topic_id},`restore-title:${v.id}:${v.topic_id}`);
     })();
     return;
   }
