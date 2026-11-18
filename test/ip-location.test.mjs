@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {createIpCnLookup,parseIpCnPage,parseIp138Response} from '../ip-location.mjs';
+import {createIpCnLookup,parseIpCnPage,parseIpWhoIsResponse} from '../ip-location.mjs';
 const page=(ip,region)=>`<table><tr><th>您查询的IP</th><td><span>${ip}</span><a>Ping</a></td></tr><tr><th><span>所在地理位置</span></th><td><span>${region}</span><a>查看区县</a></td></tr></table>`;
 test('IP.cn location comes from the geography cell rather than ISP or links',()=>{
  assert.equal(parseIpCnPage(page('223.5.5.5','中国 浙江 杭州'),'223.5.5.5'),'浙江杭州');
@@ -30,7 +30,7 @@ test('timeouts, redirects, malformed and oversized responses fail to unknown wit
 
 test('twenty different IPs wait for capacity, never exceed two requests and deduplicate queued IPs',async()=>{
  let active=0,maxActive=0,calls=0;
- const lookup=createIpCnLookup({ip138Token:'',fetchImpl:async url=>{
+ const lookup=createIpCnLookup({fetchImpl:async url=>{
   calls++;active++;maxActive=Math.max(active,maxActive);await new Promise(r=>setTimeout(r,10));active--;
   const ip=decodeURIComponent(new URL(url).pathname.slice(4,-5));
   return new Response(page(ip,'中国 浙江 杭州'),{headers:{'content-type':'text/html'}});
@@ -43,36 +43,50 @@ test('twenty different IPs wait for capacity, never exceed two requests and dedu
 test('canonical IPv6 and mapped IPv4 are compared by address while real mismatches remain rejected',async()=>{
  assert.equal(parseIpCnPage(page('2400:3200::1','中国 浙江 杭州'),'2400:3200:0:0:0:0:0:1'),'浙江杭州');
  assert.equal(parseIpCnPage(page('2400:3200::2','中国 浙江 杭州'),'2400:3200:0:0:0:0:0:1'),'未知地区');
- let url;const lookup=createIpCnLookup({ip138Token:'',fetchImpl:async u=>{url=u;return new Response(page('223.5.5.5','中国 浙江 杭州'),{headers:{'content-type':'text/html'}});}});
+ let url;const lookup=createIpCnLookup({fetchImpl:async u=>{url=u;return new Response(page('223.5.5.5','中国 浙江 杭州'),{headers:{'content-type':'text/html'}});}});
  assert.equal(await lookup('::FFFF:df05:505'),'浙江杭州');assert.equal(url,'https://ip.cn/ip/223.5.5.5.html');
 });
 
-test('IP138 is used only after primary failure and credentials stay out of its URL',async()=>{
- const calls=[];const token='fixture-only-token';
- const lookup=createIpCnLookup({ip138Token:token,fetchImpl:async(url,options)=>{
+test('token-free secondary is requested in Chinese only after primary failure',async()=>{
+ const calls=[];
+ const lookup=createIpCnLookup({fetchImpl:async(url,options)=>{
   calls.push({url,options});assert.equal(options.redirect,'error');
   if(new URL(url).hostname==='ip.cn')throw Error('primary unavailable');
-  assert.equal(new URL(url).hostname,'api.ip138.com');assert.equal(options.headers.token,token);assert.ok(!url.includes(token));
-  return new Response(JSON.stringify({ret:'ok',ip:'223.5.5.5',data:['中国','浙江','杭州','','运营商应被排除','邮编']}));
+  const parsed=new URL(url);assert.equal(parsed.hostname,'ipwho.is');assert.equal(parsed.searchParams.get('lang'),'zh-CN');assert.equal(parsed.searchParams.get('fields'),'success,ip,country,region,city');assert.equal(options.headers.token,undefined);assert.equal(options.headers.Authorization,undefined);
+  return new Response(JSON.stringify({success:true,ip:'223.5.5.5',country:'中国',region:'浙江',city:'杭州',connection:{isp:'运营商应被排除'}}));
  }});
  assert.equal(await lookup('223.5.5.5'),'浙江杭州');assert.equal(calls.length,2);
  assert.equal(await lookup('223.5.5.5'),'浙江杭州');assert.equal(calls.length,2);
- const primary=createIpCnLookup({ip138Token:token,fetchImpl:async url=>{assert.equal(new URL(url).hostname,'ip.cn');return new Response(page('1.1.1.1','澳大利亚'),{headers:{'content-type':'text/html'}});}});
+ const primary=createIpCnLookup({fetchImpl:async url=>{assert.equal(new URL(url).hostname,'ip.cn');return new Response(page('1.1.1.1','澳大利亚'),{headers:{'content-type':'text/html'}});}});
  assert.equal(await primary('1.1.1.1'),'澳大利亚');
 });
 
-test('secondary validates address, quota/auth failures, content and missing token',async()=>{
- for(const body of ['null','{}','[]','invalid json'])assert.equal(parseIp138Response(body,'223.5.5.5'),'未知地区');
- for(const data of [{ret:'err',ip:'223.5.5.5',data:['中国','浙江','杭州','']},{ret:'ok',ip:'1.1.1.1',data:['中国','浙江','杭州','']},{ret:'ok',data:['中国','浙江','杭州','']},{ret:'ok',ip:'223.5.5.5',data:['中国','未知地区','','']}])assert.equal(parseIp138Response(JSON.stringify(data),'223.5.5.5'),'未知地区');
- assert.equal(parseIp138Response(JSON.stringify({ret:'ok',ip:'2400:3200::1',data:['中国','浙江','杭州','']}),'2400:3200:0:0:0:0:0:1'),'浙江杭州');
- for(const token of ['', 'fixture-token']){
-  let calls=0;const lookup=createIpCnLookup({ip138Token:token,fetchImpl:async()=>{calls++;return new Response('{}',{status:202});}});
-  assert.equal(await lookup('223.5.5.5'),'未知地区');assert.equal(calls,token?2:1);
+test('secondary validates address, Chinese fields, failed results and malformed content',async()=>{
+ const valid={success:true,ip:'223.5.5.5',country:'中国',region:'浙江',city:'杭州'};
+ for(const body of ['null','{}','[]','invalid json'])assert.equal(parseIpWhoIsResponse(body,'223.5.5.5'),'未知地区');
+ for(const data of [{...valid,success:false},{...valid,ip:'1.1.1.1'},{...valid,ip:undefined},{...valid,region:'未知地区'},{...valid,city:12},{...valid,country:'China'}])assert.equal(parseIpWhoIsResponse(JSON.stringify(data),'223.5.5.5'),'未知地区');
+ assert.equal(parseIpWhoIsResponse(JSON.stringify({...valid,ip:'2400:3200::1'}),'2400:3200:0:0:0:0:0:1'),'浙江杭州');
+ assert.equal(parseIpWhoIsResponse(JSON.stringify({...valid,ip:'8.8.8.8',country:'美国',region:'加利福尼亚州',city:'聖荷西'}),'8.8.8.8'),'美国加利福尼亚州聖荷西');
+ assert.equal(parseIpWhoIsResponse(JSON.stringify({...valid,country:'美国',region:'California',city:'San Jose'}),'223.5.5.5'),'美国');
+ let calls=0;const lookup=createIpCnLookup({fetchImpl:async()=>{calls++;return new Response('{}',{status:202});}});
+ assert.equal(await lookup('223.5.5.5'),'未知地区');assert.equal(calls,2);
+});
+
+test('secondary rate limits pause all new fallback requests until Retry-After expires',async()=>{
+ for(const dateHeader of [false,true]){
+  let time=Date.UTC(2026,10,18),secondaryCalls=0;
+  const lookup=createIpCnLookup({now:()=>time,fetchImpl:async url=>{
+   const u=new URL(url);if(u.hostname==='ip.cn')throw Error('primary unavailable');secondaryCalls++;
+   if(secondaryCalls===1)return new Response('{}',{status:429,headers:{'retry-after':dateHeader?new Date(time+120000).toUTCString():'120'}});
+   return new Response(JSON.stringify({success:true,ip:decodeURIComponent(u.pathname.slice(1)),country:'中国',region:'浙江',city:'杭州'}));
+  }});
+  assert.equal(await lookup('8.8.8.1'),'未知地区');assert.equal(await lookup('8.8.8.2'),'未知地区');assert.equal(secondaryCalls,1);
+  time+=121000;assert.equal(await lookup('8.8.8.2'),'浙江杭州');assert.equal(secondaryCalls,2);
  }
 });
 
 test('capacity overflow is bounded and can be retried once capacity recovers',async()=>{
  let release;const gate=new Promise(r=>release=r);
- const lookup=createIpCnLookup({maxPending:2,maxConcurrent:1,ip138Token:'',fetchImpl:async url=>{await gate;const ip=decodeURIComponent(new URL(url).pathname.slice(4,-5));return new Response(page(ip,'中国 浙江 杭州'),{headers:{'content-type':'text/html'}});}});
+ const lookup=createIpCnLookup({maxPending:2,maxConcurrent:1,fetchImpl:async url=>{await gate;const ip=decodeURIComponent(new URL(url).pathname.slice(4,-5));return new Response(page(ip,'中国 浙江 杭州'),{headers:{'content-type':'text/html'}});}});
  const a=lookup('8.8.8.1'),b=lookup('8.8.8.2');assert.equal(await lookup('8.8.8.3'),'未知地区');release();await Promise.all([a,b]);assert.equal(await lookup('8.8.8.3'),'浙江杭州');
 });

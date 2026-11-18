@@ -13,7 +13,7 @@ const wait=ms=>new Promise(r=>setTimeout(r,ms));
 async function until(fn,timeout=12000){const start=Date.now();while(Date.now()-start<timeout){const result=await fn();if(result)return result;await wait(30);}throw Error('Timed out '+logs.slice(-500));}
 async function reserve(){const s=createServer();await new Promise(r=>s.listen(0,'127.0.0.1',r));const port=s.address().port;await new Promise(r=>s.close(r));return port;}
 async function start(){
- child=spawn(process.execPath,['--import',new URL('./fixtures/geo-fetch.mjs',import.meta.url).pathname,'server.mjs'],{env:{...process.env,PORT:new URL(base).port,HOST:'127.0.0.1',PUBLIC_ORIGIN:base,ALLOWED_ORIGINS:'',DATA_DIR:data,BOT_TOKEN:'123:test-token',TG_CHAT_ID:'-100123',STAFF_IDS:'42',WEBHOOK_SECRET:'region-secret',GEO_ENABLED:'1',IP138_TOKEN:'fixture-token',KF_GEO_TEST_URL:`http://127.0.0.1:${mock.address().port}/geo`,TG_API_BASE:`http://127.0.0.1:${mock.address().port}`,NODE_ENV:'test'},stdio:['ignore','pipe','pipe']});
+ child=spawn(process.execPath,['--import',new URL('./fixtures/geo-fetch.mjs',import.meta.url).pathname,'server.mjs'],{env:{...process.env,PORT:new URL(base).port,HOST:'127.0.0.1',PUBLIC_ORIGIN:base,ALLOWED_ORIGINS:'',DATA_DIR:data,BOT_TOKEN:'123:test-token',TG_CHAT_ID:'-100123',STAFF_IDS:'42',WEBHOOK_SECRET:'region-secret',GEO_ENABLED:'1',KF_GEO_TEST_URL:`http://127.0.0.1:${mock.address().port}/geo`,TG_API_BASE:`http://127.0.0.1:${mock.address().port}`,NODE_ENV:'test'},stdio:['ignore','pipe','pipe']});
  child.stdout.on('data',d=>logs+=d);child.stderr.on('data',d=>logs+=d);
  await until(async()=>{try{return(await fetch(base+'/healthz')).ok;}catch{return false;}});
 }
@@ -27,10 +27,10 @@ before(async()=>{
   try{
    if(req.url.startsWith('/geo/')){
     const url=new URL(req.url,'http://test'),provider=url.pathname.split('/')[2];
-    const ip=provider==='ip.cn'?decodeURIComponent(url.pathname.split('/').pop().slice(0,-5)):url.searchParams.get('ip');
+    const leaf=decodeURIComponent(url.pathname.split('/').pop()),ip=provider==='ip.cn'?leaf.slice(0,-5):leaf;
     const mode=modes.get(ip)||{};calls.push({method:'lookup',ip,provider});await wait(mode.delay??250);
-    if(mode.primaryFail&&provider==='ip.cn'||mode.secondaryFail&&provider==='api.ip138.com'){res.writeHead(503);res.end('unavailable');return;}
-    if(provider==='api.ip138.com'){assert.equal(req.headers.token,'fixture-token');res.setHeader('Content-Type','application/json');res.end(JSON.stringify({ret:'ok',ip,data:['中国','浙江','杭州','']}));return;}
+    if(mode.primaryFail&&provider==='ip.cn'||mode.secondaryFail&&provider==='ipwho.is'){res.writeHead(503);res.end('unavailable');return;}
+    if(provider==='ipwho.is'){assert.equal(req.headers.token,undefined);assert.equal(url.searchParams.get('lang'),'zh-CN');res.setHeader('Content-Type','application/json');res.end(JSON.stringify({success:true,ip,country:'中国',region:'浙江',city:'杭州'}));return;}
     res.setHeader('Content-Type','text/html');res.end(`<table><tr><th>您查询的IP</th><td><span>${ip}</span></td></tr><tr><th>所在地理位置</th><td><span>中国 浙江 杭州</span></td></tr></table>`);return;
    }
    const chunks=[];for await(const c of req)chunks.push(c);const body=chunks.length?JSON.parse(Buffer.concat(chunks)):{};
@@ -57,9 +57,9 @@ test('twenty new visitors receive corrected regions while chat delivery remains 
  for(const {v}of sessions){const current=visitor(v.id);assert.equal(current.title,`${current.number}-浙江杭州`);assert.equal(names.get(current.topic_id),current.title);}
 });
 
-test('primary failure automatically uses the configured IP138 secondary',async()=>{
+test('primary failure automatically uses the token-free Chinese secondary',async()=>{
  const ip='9.9.9.9';modes.set(ip,{primaryFail:true,delay:20});const {v}=await session(ip);await until(()=>regionDone(v.id));
- assert.equal(visitor(v.id).title,`${v.number}-浙江杭州`);assert.deepEqual(calls.filter(c=>c.ip===ip).map(c=>c.provider),['ip.cn','api.ip138.com']);
+ assert.equal(visitor(v.id).title,`${v.number}-浙江杭州`);assert.deepEqual(calls.filter(c=>c.ip===ip).map(c=>c.provider),['ip.cn','ipwho.is']);
 });
 
 test('both providers failing preserves delivery and a durable region retry survives restart',async()=>{

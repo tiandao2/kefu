@@ -2,6 +2,6 @@
 const nativeFetch=globalThis.fetch;
 globalThis.fetch=(input,options)=>{
  const url=new URL(String(input));
- if(['ip.cn','api.ip138.com'].includes(url.hostname))return nativeFetch(`${process.env.KF_GEO_TEST_URL}/${url.hostname}${url.pathname}${url.search}`,options);
+ if(['ip.cn','ipwho.is'].includes(url.hostname))return nativeFetch(`${process.env.KF_GEO_TEST_URL}/${url.hostname}${url.pathname}${url.search}`,options);
  return nativeFetch(input,options);
 };

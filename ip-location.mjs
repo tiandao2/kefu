@@ -38,12 +38,16 @@ export function parseIpCnPage(html,requestedIp){
  if(!canonicalIp(requestedIp)||canonicalIp(echoed)!==canonicalIp(requestedIp)||!region||/未知|无法|查询失败|验证码|请核实/.test(region))return UNKNOWN;
  return region.replace(/^中国(?:\s+|$)/,'').replace(/\s+/g,'').slice(0,64)||UNKNOWN;
 }
-export function parseIp138Response(body,requestedIp){
+export function parseIpWhoIsResponse(body,requestedIp){
  let data;try{data=JSON.parse(body);}catch{return UNKNOWN;}
- if(!data||data.ret!=='ok'||!canonicalIp(requestedIp)||canonicalIp(data.ip)!==canonicalIp(requestedIp)||!Array.isArray(data.data))return UNKNOWN;
- const parts=data.data.slice(0,4);
+ if(!data||data.success!==true||!canonicalIp(requestedIp)||canonicalIp(data.ip)!==canonicalIp(requestedIp))return UNKNOWN;
+ const chinese=value=>/\p{Script=Han}/u.test(value)&&!/[a-z]/i.test(value);
+ if(typeof data.country!=='string'||!chinese(text(data.country)))return UNKNOWN;
+ const parts=[data.country,data.region??'',data.city??''];
  if(parts.some(x=>typeof x!=='string'))return UNKNOWN;
- const region=parts.map(text).filter(Boolean).join(' ');
+ // Some rare locations lack a translation even with lang=zh-CN. Keep only
+ // Chinese name components instead of presenting an English location.
+ const region=parts.map(text).filter(chinese).join(' ');
  if(!region||/未知|无法|查询失败|验证码|请核实/.test(region))return UNKNOWN;
  return region.replace(/^中国(?:\s+|$)/,'').replace(/\s+/g,'').slice(0,64)||UNKNOWN;
 }
@@ -53,8 +57,8 @@ async function responseBody(response){
  try{for(;;){const {done,value}=await reader.read();if(done)break;bytes+=value.length;if(bytes>256000)throw new Error('Location response too large');chunks.push(Buffer.from(value));}}finally{await reader.cancel().catch(()=>{});}
  return Buffer.concat(chunks).toString('utf8');
 }
-export function createIpCnLookup({enabled=true,fetchImpl=fetch,timeoutMs=2000,cacheMs=86400000,maxEntries=512,maxConcurrent=2,maxPending=128,ip138Token=process.env.IP138_TOKEN||'',now=Date.now}={}){
- const cache=new Map(),pending=new Map(),waiting=[];let active=0;
+export function createIpCnLookup({enabled=true,fetchImpl=fetch,timeoutMs=2000,cacheMs=86400000,maxEntries=512,maxConcurrent=2,maxPending=128,now=Date.now}={}){
+ const cache=new Map(),pending=new Map(),waiting=[];let active=0,secondaryUntil=0;
  const acquire=()=>active<maxConcurrent?(active++,Promise.resolve()):new Promise(resolve=>waiting.push(resolve));
  const release=()=>{const next=waiting.shift();if(next)next();else active--;};
  return async value=>{
@@ -67,16 +71,20 @@ export function createIpCnLookup({enabled=true,fetchImpl=fetch,timeoutMs=2000,ca
   const task=(async()=>{
    await acquire();let region=UNKNOWN;
    try{
-    const headers={'User-Agent':'Mozilla/5.0 (compatible; KFChat/1.0.3)','Accept':'text/html'};
+    const headers={'User-Agent':'Mozilla/5.0 (compatible; KFChat/1.0.4)','Accept':'text/html'};
     try{
      const response=await fetchImpl(`${SOURCE}/ip/${encodeURIComponent(ip)}.html`,{headers,redirect:'error',signal:AbortSignal.timeout(timeoutMs)});
      if(!response.headers.get('content-type')?.includes('text/html')){await response.body?.cancel();throw new Error('Invalid IP.cn content');}
      region=parseIpCnPage(await responseBody(response),ip);
     }catch{/* Try the configured secondary provider below. */}
-    if(region===UNKNOWN&&ip138Token){
+    if(region===UNKNOWN&&now()>=secondaryUntil){
      try{
-      const response=await fetchImpl(`https://api.ip138.com/ipdata/?ip=${encodeURIComponent(ip)}&datatype=jsonp`,{headers:{...headers,Accept:'application/json',token:ip138Token},redirect:'error',signal:AbortSignal.timeout(timeoutMs)});
-      region=parseIp138Response(await responseBody(response),ip);
+      const response=await fetchImpl(`https://ipwho.is/${encodeURIComponent(ip)}?lang=zh-CN&fields=success,ip,country,region,city`,{headers:{...headers,Accept:'application/json'},redirect:'error',signal:AbortSignal.timeout(timeoutMs)});
+      if(response.status===429){
+       const retry=response.headers.get('retry-after'),seconds=retry&&/^\d+$/.test(retry)?Number(retry):(Date.parse(retry)-now())/1000;
+       secondaryUntil=now()+Math.min(86400000,Math.max(1000,Number.isFinite(seconds)&&seconds>=0?seconds*1000:60000));
+      }
+      region=parseIpWhoIsResponse(await responseBody(response),ip);
      }catch{/* Both providers unavailable: the durable job can retry later. */}
     }
    }finally{release();}
