@@ -1,8 +1,8 @@
 # 在线客服：独立网页与 Telegram 话题
 
-正式入口：https://kf.wgioat.cn/
+正式入口：域名
 
-线上仅服务 `kf.wgioat.cn`。部署时同时安装 `deploy/reject-other-hosts.conf` 到 `/etc/nginx/conf.d/`，拒绝其他 SNI 域名的 TLS 握手和其他 Host 的 HTTP 请求。未发送 SNI 的连接仍使用默认的新域名证书。旧域名的 DNS 记录需在其 DNS 服务商处删除；删除服务器站点不会删除外部 DNS 记录。
+线上仅服务 `域名`。部署时同时安装 `deploy/reject-other-hosts.conf` 到 `/etc/nginx/conf.d/`，拒绝其他 SNI 域名的 TLS 握手和其他 Host 的 HTTP 请求。未发送 SNI 的连接仍使用默认的新域名证书。旧域名的 DNS 记录需在其 DNS 服务商处删除；删除服务器站点不会删除外部 DNS 记录。
 
 网站页面、API、附件及 WebSocket 对所有地区开放，不按 IP 地域限制访问。访客 Cookie、消息与附件权限、来源检查和限流继续执行。`/telegram/webhook` 仅允许 Telegram 官方来源网段，并由应用验证 webhook 密钥；这属于回调认证。`/.well-known/acme-challenge/` 保持公开供证书续期使用。
 
