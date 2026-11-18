@@ -481,9 +481,13 @@ function processUpdate(update) {
       const current=sql('SELECT * FROM visitors WHERE id=? AND topic_id=?',v.id,m.message_thread_id);
       if(!current||date<current.title_source_date||(date===current.title_source_date&&update.update_id<=current.title_source_update))return;
       run('UPDATE visitors SET title=?,auto_title=NULL,pending_title=NULL,title_source_date=?,title_source_update=? WHERE id=?',name,date,update.update_id,v.id);
-      // Save compensation before the in-flight automatic edit can finish or
-      // the process can restart. The title lock orders the actual requests.
-      if(current.pending_title)queue('restore-title',{visitorId:v.id,topicId:v.topic_id},`restore-title:${v.id}:${v.topic_id}`);
+      // The notification can arrive after an automatic request has already
+      // finished. Persist the latest manual intent even without pending_title.
+      // Replace obsolete work atomically: an older in-flight job may finish,
+      // but its success/failure cannot delete or fail this replacement job ID.
+      const dedup=`restore-title:${v.id}:${v.topic_id}`;
+      run("DELETE FROM jobs WHERE kind='restore-title' AND dedup=?",dedup);
+      queue('restore-title',{visitorId:v.id,topicId:v.topic_id},dedup);
     })();
     return;
   }

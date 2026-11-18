@@ -24,6 +24,7 @@ async function sendText(cookie,clientId){const form=new FormData();form.set('cli
 const sent=id=>db.prepare('SELECT * FROM messages WHERE id=? AND status=?').get(id,'sent');
 const visitor=id=>db.prepare('SELECT * FROM visitors WHERE id=?').get(id);
 const regionDone=id=>!db.prepare("SELECT 1 FROM jobs WHERE kind='region' AND json_extract(payload,'$.visitorId')=?").get(id);
+const titleJob=id=>db.prepare("SELECT * FROM jobs WHERE kind='restore-title' AND json_extract(payload,'$.visitorId')=?").get(id);
 before(async()=>{
  mock=createServer(async(req,res)=>{
   try{
@@ -170,4 +171,52 @@ test('new topic bindings and later timestamps accept lower update ids',async()=>
  assert.notEqual(current.topic_id,original.topic_id);assert.equal(names.get(current.topic_id),'一周后的人工名称');
  names.set(current.topic_id,'新话题独立人工名称');await hook(current,'新话题独立人工名称',false,{id:999,date:date-1});assert.equal(visitor(v.id).title,'新话题独立人工名称');
  await hook(original,'旧话题晚到通知',false,{id:10001,date:date+1});assert.equal(visitor(v.id).title,'新话题独立人工名称');
+});
+
+test('late manual notification after the automatic response corrects the remote title',async()=>{
+ const ip='8.8.8.31';modes.set(ip,{delay:400});const {v,cookie}=await session(ip);const current=await until(()=>visitor(v.id).topic_id&&visitor(v.id));
+ blockingTopic=current.topic_id;editStarted=false;await until(()=>editStarted);const date=Math.floor(Date.now()/1000),name='延迟通知的人工名称';
+ try{
+  names.set(current.topic_id,name);const message=await sendText(cookie,'send-before-late-name-notice');await until(()=>sent(message.id),1800);
+ }finally{releaseEdit?.();releaseEdit=null;}
+ await until(()=>regionDone(v.id));assert.equal(names.get(current.topic_id),`${v.number}-浙江杭州`);assert.equal(visitor(v.id).pending_title,null);
+ await hook(current,name,false,{id:20000,date});
+ await until(()=>names.get(current.topic_id)===name&&!titleJob(v.id),2000);
+ assert.equal(visitor(v.id).title,name);assert.equal(visitor(v.id).auto_title,null);
+});
+
+test('late correction survives a failed attempt and restart without accepting an old name',async()=>{
+ const {v}=await session('192.168.1.20');const current=await until(()=>visitor(v.id).topic_id&&visitor(v.id)),date=Math.floor(Date.now()/1000),name='重启后补齐人工名';
+ failedRestoreTitle=name;await hook(current,name,false,{id:20002,date});const job=await until(()=>titleJob(v.id)?.attempts>0&&titleJob(v.id));
+ assert.equal(job.state,'pending');assert.equal(visitor(v.id).pending_title,null);assert.notEqual(names.get(current.topic_id),name);
+ await stop();db.prepare('UPDATE jobs SET available_at=0 WHERE id=?').run(job.id);await start();
+ await until(()=>names.get(current.topic_id)===name&&!titleJob(v.id));
+ await hook(current,'晚到旧名',false,{id:20001,date:date-1});
+ assert.equal(visitor(v.id).title,name);assert.equal(names.get(current.topic_id),name);assert.equal(titleJob(v.id),undefined);
+});
+
+test('a newer manual intent replaces an in-flight correction even when the old request fails',async()=>{
+ const {v}=await session('192.168.1.21');const current=await until(()=>visitor(v.id).topic_id&&visitor(v.id)),date=Math.floor(Date.now()/1000);
+ blockingTopic=current.topic_id;editStarted=false;failedRestoreTitle='旧校正请求';await hook(current,'旧校正请求',false,{id:20011,date});await until(()=>editStarted);
+ const obsolete=titleJob(v.id);assert.ok(obsolete);
+ try{
+  names.set(current.topic_id,'新的人工意图');await hook(current,'新的人工意图',false,{id:20012,date});
+  const latest=titleJob(v.id);assert.ok(latest);assert.notEqual(latest.id,obsolete.id);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM jobs WHERE kind='restore-title' AND json_extract(payload,'$.visitorId')=?").get(v.id).n,1);
+ }finally{releaseEdit?.();releaseEdit=null;}
+ await until(()=>names.get(current.topic_id)==='新的人工意图'&&!titleJob(v.id));assert.equal(visitor(v.id).title,'新的人工意图');
+});
+
+test('an old manual correction cannot rename a replacement topic',async()=>{
+ const {v,cookie}=await session('192.168.1.22');const original=await until(()=>visitor(v.id).topic_id&&visitor(v.id)),date=Math.floor(Date.now()/1000);
+ blockingTopic=original.topic_id;editStarted=false;await hook(original,'重建时保留的人工名',false,{id:20021,date});await until(()=>editStarted);
+ let current;
+ try{
+  deletedTopics.add(original.topic_id);const message=await sendText(cookie,'rebuild-during-old-correction');await until(()=>sent(message.id),1800);
+  current=visitor(v.id);assert.notEqual(current.topic_id,original.topic_id);assert.equal(current.token_hash,original.token_hash);
+  names.set(current.topic_id,'新话题最新人工名');await hook(current,'新话题最新人工名',false,{id:20022,date});
+ }finally{releaseEdit?.();releaseEdit=null;}
+ await until(()=>names.get(current.topic_id)==='新话题最新人工名'&&!titleJob(v.id));
+ assert.equal(visitor(v.id).title,'新话题最新人工名');assert.equal(visitor(v.id).topic_id,current.topic_id);
+ assert.ok(!calls.some(c=>c.method==='editForumTopic'&&c.body.message_thread_id===current.topic_id&&c.body.name==='重建时保留的人工名'));
 });
